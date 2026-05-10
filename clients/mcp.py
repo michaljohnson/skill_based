@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -11,7 +12,32 @@ from mcp.client.streamable_http import streamablehttp_client
 
 logger = logging.getLogger(__name__)
 
-MCP_CONFIG_PATH = Path(__file__).parent.parent / ".mcp.json"
+def _find_mcp_config() -> Path:
+    """Locate ``.mcp.json``.
+
+    Resolution order:
+      1. ``MCP_CONFIG_PATH`` env var (explicit override).
+      2. Walk up from the package directory looking for ``.mcp.json``.
+         Stops at the first hit; falls through to the filesystem root.
+      3. If nothing found, return the package root path so the resulting
+         ``FileNotFoundError`` points at a sensible "expected" location.
+
+    The walk-up search supports two common layouts: standalone clones
+    (``.mcp.json`` at the package root) and multi-package monorepos
+    (``.mcp.json`` at the workspace root above multiple packages).
+    """
+    override = os.environ.get("MCP_CONFIG_PATH")
+    if override:
+        return Path(override)
+    pkg_root = Path(__file__).parent.parent  # skill_based/
+    for d in [pkg_root, *pkg_root.parents]:
+        candidate = d / ".mcp.json"
+        if candidate.is_file():
+            return candidate
+    return pkg_root / ".mcp.json"
+
+
+MCP_CONFIG_PATH = _find_mcp_config()
 
 # Short names for cleaner tool prefixes
 SERVER_SHORT_NAMES = {
@@ -53,7 +79,19 @@ class MCPClient:
         servers = config["mcpServers"]
 
         for server_name, server_config in servers.items():
-            url = server_config["url"]
+            # Only connect to the four robot MCP servers; .mcp.json may
+            # also contain Claude Code research tools (consensus / paperplain /
+            # fetch) which are stdio or remote-https and not relevant to
+            # the agents.
+            if server_name not in SERVER_SHORT_NAMES:
+                logger.debug(f"Skipping non-robot MCP server: {server_name}")
+                continue
+            url = server_config.get("url")
+            if not url:
+                logger.warning(
+                    f"Skipping {server_name}: no URL (stdio transport not supported)"
+                )
+                continue
             try:
                 transport = await self._exit_stack.enter_async_context(
                     streamablehttp_client(url=url, timeout=30)

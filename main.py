@@ -13,8 +13,13 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 
-from skill_based.mcp_client import MCPClient
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
+
+from skill_based.clients.mcp import MCPClient
 from skill_based.planner import run_planner
 from skill_based.skills import navigate as navigate_skill
 from skill_based.skills import pick as pick_skill
@@ -22,10 +27,15 @@ from skill_based.skills import place as place_skill
 
 # === CONFIGURATION ===
 
-# Default LLM model for the planner. Skill-based intentionally targets
-# a smaller model (Claude Haiku) because the deterministic skills absorb
-# the per-step reasoning load. See methodology Section 2.1.3.
-LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-haiku-4-5-20251001")
+# Default LLM model for the planner. The skill-based architecture
+# intentionally targets a smaller open-weights model: the deterministic
+# Python skills absorb the per-step reasoning load, so the planner only
+# needs to pick from three skills and supply structured arguments.
+#
+# Any LiteLLM-supported model works. For an OpenAI-compatible endpoint
+# (vLLM, Ollama, LocalAI, etc.) set OPENAI_API_BASE + OPENAI_API_KEY
+# in `.env`; for Anthropic set ANTHROPIC_API_KEY. See `.env.example`.
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/cyankiwi/Qwen3.6-27B-AWQ-INT4")
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", LLM_MODEL)
 
 
@@ -37,10 +47,17 @@ async def test_pick(object_name: str) -> None:
         print(json.dumps(result, indent=2))
 
 
-async def test_place(target_container: str) -> None:
-    print(f"\n=== Testing place skill: target='{target_container}' ===\n")
+async def test_place(
+    target_container: str,
+    object_name: str | None = None,
+) -> None:
+    print(f"\n=== Testing place skill: target='{target_container}' object='{object_name}' ===\n")
     async with MCPClient() as mcp:
-        result = await place_skill.run(mcp=mcp, target_container=target_container)
+        result = await place_skill.run(
+            mcp=mcp,
+            target_container=target_container,
+            object_name=object_name,
+        )
         print(f"\n=== Result ===")
         print(json.dumps(result, indent=2))
 
@@ -138,7 +155,7 @@ def main() -> None:
                 "skill_based.skills.pick":     "[PICK]    ",
                 "skill_based.skills.place":    "[PLACE]   ",
                 "skill_based.skills.common":   "[COMMON]  ",
-                "skill_based.mcp_client":      "[MCP]     ",
+                "skill_based.clients.mcp":      "[MCP]     ",
             }
 
             def format(self, record: logging.LogRecord) -> str:
@@ -159,12 +176,12 @@ def main() -> None:
     logging.getLogger("mcp").setLevel(framework_level)
     logging.getLogger("LiteLLM").setLevel(framework_level)
     logging.getLogger("litellm").setLevel(framework_level)
-    logging.getLogger("skill_based.mcp_client").setLevel(framework_level)
+    logging.getLogger("skill_based.clients.mcp").setLevel(framework_level)
 
     if args.test_pick:
         asyncio.run(test_pick(args.test_pick))
     elif args.test_place:
-        asyncio.run(test_place(args.test_place))
+        asyncio.run(test_place(args.test_place, args.target_object))
     elif args.test_navigate:
         dest = " ".join(args.test_navigate)
         asyncio.run(test_navigate(dest, args.mode, args.target_object))

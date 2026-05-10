@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy to .mcp.json (gitignored) and edit URLs/ports for your setup. Resolution order: MCP_CONFIG_PATH env var, then walk-up from the package directory.",
+  "mcpServers": {
+    "ros-mcp-server": {
+      "url": "http://127.0.0.1:8888/mcp",
+      "type": "http"
+    },
+    "moveit-mcp-server": {
+      "url": "http://127.0.0.1:8001/mcp",
+      "type": "http"
+    },
+    "nav2-mcp-server": {
+      "url": "http://127.0.0.1:8002/mcp",
+      "type": "http"
+    },
+    "perception-mcp-server": {
+      "url": "http://127.0.0.1:8003/mcp",
+      "type": "http"
+    }
+  }
+}

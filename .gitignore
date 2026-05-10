@@ -31,6 +31,10 @@ env/
 venv/
 ENV/
 
+# Local MCP server config (URLs, ports, optional secrets) — keep .example committed
+.mcp.json
+!.mcp.json.example
+
 # IDE
 .vscode/
 .idea/

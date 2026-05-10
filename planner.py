@@ -1,6 +1,6 @@
 """Planner agent for the skill-based architecture.
 
-The planner is a small LLM (Claude Haiku by default) that receives a
+The planner is a (typically small, open-weights) LLM that receives a
 natural-language task instruction and decides which deterministic skill
 to invoke next: ``navigate``, ``pick``, or ``place``. It does NOT see
 the underlying MCP tool surface; its decision space is the three skills
@@ -11,9 +11,10 @@ internally calls MCP tools through the shared ``MCPClient``. The planner
 treats skills as black-box LLM tools (via the LiteLLM tool-use protocol),
 receiving a structured success/failure result back from each call.
 
-This separation is the design point of the architecture (see methodology
-Section 2.1.3): the deterministic skill layer absorbs the per-step
-reasoning load, allowing the planner to use a smaller and cheaper model.
+This separation is the design point of the architecture: the
+deterministic skill layer absorbs the per-step reasoning load, allowing
+the planner to use a smaller open-weights model than a tool-using
+agent that sees the raw MCP surface would require.
 """
 
 import json
@@ -21,7 +22,7 @@ import logging
 import os
 from pathlib import Path
 
-from skill_based.llm_client import (
+from skill_based.clients.llm import (
     assistant_message,
     call_llm,
     get_text_content,
@@ -30,17 +31,20 @@ from skill_based.llm_client import (
     tool_result_message,
     wants_tool_use,
 )
-from skill_based.mcp_client import MCPClient
+from skill_based.clients.mcp import MCPClient
 from skill_based.skills import navigate as navigate_skill
 from skill_based.skills import pick as pick_skill
 from skill_based.skills import place as place_skill
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_FILE = Path(__file__).parent / "prompts" / "planner.md"
+_PROMPT_FILE = Path(__file__).parent / "planner.md"
 PLANNER_MODEL = os.environ.get(
     "PLANNER_MODEL",
-    os.environ.get("LLM_MODEL", "anthropic/claude-haiku-4-5-20251001"),
+    os.environ.get(
+        "LLM_MODEL",
+        "openai/cyankiwi/Qwen3.6-27B-AWQ-INT4",
+    ),
 )
 
 # === Skill tool schemas (LiteLLM / OpenAI format) ===
@@ -198,7 +202,15 @@ async def run_planner(
         for tool_call_id, name, args in get_tool_calls(response):
             logger.info(f"[planner] -> {name}({json.dumps(args)})")
             result = await _dispatch_skill(mcp, name, args)
-            logger.info(f"[planner] <- {name} : {result.get('success')}")
+            success = result.get("success")
+            reason = result.get("reason", "")
+            calls = result.get("tool_calls_used", "?")
+            if success:
+                logger.info(f"[planner] <- {name} : True ({calls} calls) {reason}")
+            else:
+                logger.warning(
+                    f"[planner] <- {name} : False ({calls} calls) {reason}"
+                )
             messages.append(tool_result_message(tool_call_id, json.dumps(result)))
 
     return {
