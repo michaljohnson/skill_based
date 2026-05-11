@@ -174,13 +174,20 @@ async def run_planner(
     """Run the planner LLM on a natural-language task.
 
     Returns:
-        ``{"summary": str, "turns_used": int, "success": bool}``
+        ``{"summary": str, "turns_used": int, "skill_tool_calls_total": int,
+        "success": bool}``
+
+        ``skill_tool_calls_total`` sums the MCP tool calls each skill
+        made internally. Parallels ``subagent_tool_calls_total`` in the
+        multi-agent orchestrator so the thesis comparison matrix can
+        compare like-with-like across architectures.
     """
     model = model or PLANNER_MODEL
     messages = [
         {"role": "system", "content": _load_system_prompt()},
         {"role": "user", "content": task},
     ]
+    skill_tool_calls_total = 0
 
     for turn in range(max_turns):
         logger.info(f"[planner] turn {turn + 1}/{max_turns}")
@@ -193,6 +200,7 @@ async def run_planner(
             return {
                 "summary": text,
                 "turns_used": turn + 1,
+                "skill_tool_calls_total": skill_tool_calls_total,
                 "success": True,
             }
 
@@ -205,6 +213,10 @@ async def run_planner(
             success = result.get("success")
             reason = result.get("reason", "")
             calls = result.get("tool_calls_used", "?")
+            try:
+                skill_tool_calls_total += int(calls)
+            except (TypeError, ValueError):
+                pass
             if success:
                 logger.info(f"[planner] <- {name} : True ({calls} calls) {reason}")
             else:
@@ -216,5 +228,6 @@ async def run_planner(
     return {
         "summary": "max planner turns exceeded",
         "turns_used": max_turns,
+        "skill_tool_calls_total": skill_tool_calls_total,
         "success": False,
     }

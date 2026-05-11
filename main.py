@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -42,7 +43,9 @@ PLANNER_MODEL = os.environ.get("PLANNER_MODEL", LLM_MODEL)
 async def test_pick(object_name: str) -> None:
     print(f"\n=== Testing pick skill: '{object_name}' ===\n")
     async with MCPClient() as mcp:
+        t0 = time.perf_counter()
         result = await pick_skill.run(mcp=mcp, object_name=object_name)
+        result["wall_seconds"] = round(time.perf_counter() - t0, 2)
         print(f"\n=== Result ===")
         print(json.dumps(result, indent=2))
 
@@ -53,11 +56,13 @@ async def test_place(
 ) -> None:
     print(f"\n=== Testing place skill: target='{target_container}' object='{object_name}' ===\n")
     async with MCPClient() as mcp:
+        t0 = time.perf_counter()
         result = await place_skill.run(
             mcp=mcp,
             target_container=target_container,
             object_name=object_name,
         )
+        result["wall_seconds"] = round(time.perf_counter() - t0, 2)
         print(f"\n=== Result ===")
         print(json.dumps(result, indent=2))
 
@@ -71,12 +76,14 @@ async def test_navigate(
     if target_object:
         print(f"    Target object: '{target_object}'")
     async with MCPClient() as mcp:
+        t0 = time.perf_counter()
         result = await navigate_skill.run(
             mcp=mcp,
             destination=destination,
             mode=mode,
             target_object=target_object,
         )
+        result["wall_seconds"] = round(time.perf_counter() - t0, 2)
         print(f"\n=== Result ===")
         print(json.dumps(result, indent=2))
 
@@ -85,10 +92,14 @@ async def run_full(task: str) -> None:
     print(f"\n=== Task: {task} ===")
     print(f"Planner: {PLANNER_MODEL}\n")
     async with MCPClient() as mcp:
+        t0 = time.perf_counter()
         result = await run_planner(mcp=mcp, task=task, model=PLANNER_MODEL)
+        wall_seconds = round(time.perf_counter() - t0, 2)
         print(f"\n=== Final Report ===")
         print(result["summary"])
-        print(f"\nPlanner turns used: {result['turns_used']}")
+        print(f"\nPlanner turns used:        {result['turns_used']}")
+        print(f"Skill tool calls total:    {result['skill_tool_calls_total']}")
+        print(f"Wall-clock total:          {wall_seconds}s ({wall_seconds / 60:.1f} min)")
 
 
 def main() -> None:
