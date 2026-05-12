@@ -75,13 +75,13 @@ PLANNER_TOOLS = [
                             "(e.g. 'wooden coffee table', 'trash bin')."
                         ),
                     },
-                    "mode": {
+                    "next_action": {
                         "type": "string",
-                        "enum": ["pick", "surface_place", "container_place"],
-                        "description": "Why we are navigating; controls approach standoff.",
+                        "enum": ["pick", "surface_place", "container_place", "floor_place"],
+                        "description": "What the planner intends to do immediately after this call. Controls the approach standoff distance.",
                     },
                 },
-                "required": ["destination", "mode"],
+                "required": ["destination", "next_action"],
             },
         },
     },
@@ -142,7 +142,7 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
         return await approach_skill.run(
             mcp=mcp,
             destination=args["destination"],
-            mode=args["mode"],
+            next_action=args["next_action"],
             target_object=args.get("target_object"),
         )
     if name == "pick":

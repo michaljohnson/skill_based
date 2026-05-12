@@ -1,10 +1,10 @@
 """Approach skill — deterministic Python find-and-approach primitive.
 
 The skill takes a named destination, an optional target object, and a
-mode that selects standoff distance. It tucks the arm, drives the base
-to the entry pose for the destination, waits for the base to settle,
-and (when ``target_object`` is given) refines the approach via
-``approach_target`` plus a fall-back ``spin_search``.
+``next_action`` flag that selects standoff distance. It tucks the arm,
+drives the base to the entry pose for the destination, waits for the
+base to settle, and (when ``target_object`` is given) refines the
+approach via ``approach_target`` plus a fall-back ``spin_search``.
 
 The four-phase contract (coarse drive → area settle → target search →
 fine approach to standoff) is the reason this skill is named ``approach``
@@ -21,7 +21,7 @@ import logging
 
 from skill_based.clients.mcp import MCPClient
 from skill_based.skills.common import (
-    STANDOFF_BY_MODE,
+    STANDOFF_BY_NEXT_ACTION,
     approach_target,
     geometric_fallback_prompts,
     move_arm_to_look_forward,
@@ -61,7 +61,7 @@ def _resolve_destination(name: str) -> dict[str, float] | None:
 async def run(
     mcp: MCPClient,
     destination: str,
-    mode: str,
+    next_action: str,
     target_object: str | None = None,
 ) -> dict:
     """Drive the robot to ``destination``, optionally approaching ``target_object``.
@@ -69,9 +69,10 @@ async def run(
     Args:
         mcp: shared MCP client.
         destination: named area key (must be in ``NAMED_AREA_POSES``).
-        mode: one of ``pick``, ``surface_place``, ``container_place``,
-            ``floor_place``; selects the standoff for the optional
-            approach refinement.
+        next_action: one of ``pick``, ``surface_place``, ``container_place``,
+            ``floor_place``; declares what the planner intends to do
+            immediately after this skill returns. Selects the standoff
+            for the optional approach refinement.
         target_object: optional surface or object to approach within the
             destination. When given, the skill segments it on the front
             camera, drives to standoff, and falls back to spin-search if
@@ -82,10 +83,10 @@ async def run(
     """
     tool_calls = 0
 
-    if mode not in STANDOFF_BY_MODE:
+    if next_action not in STANDOFF_BY_NEXT_ACTION:
         return {
             "success": False,
-            "reason": f"unknown mode: {mode}",
+            "reason": f"unknown next_action: {next_action}",
             "tool_calls_used": tool_calls,
         }
 
@@ -100,9 +101,9 @@ async def run(
             "tool_calls_used": tool_calls,
         }
 
-    standoff_m = STANDOFF_BY_MODE[mode]
+    standoff_m = STANDOFF_BY_NEXT_ACTION[next_action]
     logger.info(
-        f"approach -> dest='{destination}' mode={mode} "
+        f"approach -> dest='{destination}' next_action={next_action} "
         f"standoff={standoff_m:.2f}m target='{target_object}'"
     )
 

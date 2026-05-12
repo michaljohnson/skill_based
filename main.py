@@ -69,10 +69,10 @@ async def test_place(
 
 async def test_approach(
     destination: str,
-    mode: str,
+    next_action: str,
     target_object: str | None = None,
 ) -> None:
-    print(f"\n=== Testing approach skill: '{destination}' (mode={mode}) ===")
+    print(f"\n=== Testing approach skill: '{destination}' (next_action={next_action}) ===")
     if target_object:
         print(f"    Target object: '{target_object}'")
     async with MCPClient() as mcp:
@@ -80,7 +80,7 @@ async def test_approach(
         result = await approach_skill.run(
             mcp=mcp,
             destination=destination,
-            mode=mode,
+            next_action=next_action,
             target_object=target_object,
         )
         result["wall_seconds"] = round(time.perf_counter() - t0, 2)
@@ -130,14 +130,14 @@ def main() -> None:
         nargs="+",
         metavar="DEST",
         default=None,
-        help="Test approach skill to DEST (no planner). Combine with --mode and optionally --target-object.",
+        help="Test approach skill to DEST (no planner). Combine with --next-action and optionally --target-object.",
     )
     parser.add_argument(
-        "--mode",
+        "--next-action",
         type=str,
-        choices=["pick", "surface_place", "container_place"],
+        choices=["pick", "surface_place", "container_place", "floor_place"],
         default="pick",
-        help="Approach mode (selects standoff distance). Used with --test-approach.",
+        help="What the planner intends to do after the approach (selects standoff distance). Used with --test-approach.",
     )
     parser.add_argument(
         "--target-object",
@@ -195,7 +195,7 @@ def main() -> None:
         asyncio.run(test_place(args.test_place, args.target_object))
     elif args.test_approach:
         dest = " ".join(args.test_approach)
-        asyncio.run(test_approach(dest, args.mode, args.target_object))
+        asyncio.run(test_approach(dest, args.next_action, args.target_object))
     elif args.task:
         asyncio.run(run_full(args.task))
     else:

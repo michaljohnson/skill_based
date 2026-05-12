@@ -20,21 +20,21 @@ from skill_based.clients.mcp import MCPClient
 logger = logging.getLogger(__name__)
 
 
-# === Mode-aware standoff distances (from navigator.py _STANDOFF_BY_MODE) ===
+# === Standoff distance by next_action (parallels multi_agent's _STANDOFF_BY_NEXT_ACTION) ===
 #
 # The right standoff depends on what the manipulation step does once
-# the navigator hands off:
+# the approach skill hands off:
 #   - pick: UR5 reaches forward at low z (~0.40m); 0.85m centroid
 #     distance leaves comfortable headroom for grasp pose math.
 #   - surface_place: wrist must be HIGH (surface_z + 0.31m for can on
 #     coffee table = 0.66m). UR5 top-down reach at z=0.66m caps near
-#     x=0.55m, so navigator must deliver closer (~0.45m).
+#     x=0.55m, so the approach skill must deliver closer (~0.45m).
 #   - container_place: drop INTO the bin from above; wrist sits 35cm
 #     above rim. Same UR5 high-z constraints apply but rim is usually
 #     at moderate height; 0.65m gives margin.
 #   - floor_place: similar to pick — soft set-down at low z.
 
-STANDOFF_BY_MODE = {
+STANDOFF_BY_NEXT_ACTION = {
     "pick": 0.85,
     "surface_place": 0.45,
     "container_place": 0.65,
