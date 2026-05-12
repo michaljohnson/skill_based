@@ -39,13 +39,24 @@ from skill_based.skills import place as place_skill
 logger = logging.getLogger(__name__)
 
 _PROMPT_FILE = Path(__file__).parent / "planner.md"
-PLANNER_MODEL = os.environ.get(
-    "PLANNER_MODEL",
-    os.environ.get(
-        "LLM_MODEL",
-        "openai/cyankiwi/Qwen3.6-27B-AWQ-INT4",
-    ),
-)
+
+
+def _resolve_default_model() -> str:
+    """Return PLANNER_MODEL or LLM_MODEL from the environment.
+
+    Raises ``RuntimeError`` if neither is set. Resolved lazily (at
+    ``run_planner`` call time, not module import time) so importing
+    this module for unit tests or REPL exploration does not require
+    a configured ``.env``.
+    """
+    model = os.environ.get("PLANNER_MODEL") or os.environ.get("LLM_MODEL")
+    if not model:
+        raise RuntimeError(
+            "no LLM model configured: set LLM_MODEL (or PLANNER_MODEL) "
+            "in skill_based/.env. See skill_based/.env.example for the "
+            "supported options."
+        )
+    return model
 
 # === Skill tool schemas (LiteLLM / OpenAI format) ===
 # These are what the planner LLM sees. The names and arguments are the
@@ -182,7 +193,7 @@ async def run_planner(
         multi-agent orchestrator so the thesis comparison matrix can
         compare like-with-like across architectures.
     """
-    model = model or PLANNER_MODEL
+    model = model or _resolve_default_model()
     messages = [
         {"role": "system", "content": _load_system_prompt()},
         {"role": "user", "content": task},

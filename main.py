@@ -28,15 +28,21 @@ from skill_based.skills import place as place_skill
 
 # === CONFIGURATION ===
 
-# Default LLM model for the planner. The skill-based architecture
-# intentionally targets a smaller open-weights model: the deterministic
-# Python skills absorb the per-step reasoning load, so the planner only
-# needs to pick from three skills and supply structured arguments.
+# LLM model for the planner. The skill-based architecture intentionally
+# targets a smaller open-weights model: the deterministic Python skills
+# absorb the per-step reasoning load, so the planner only needs to pick
+# from three skills and supply structured arguments.
 #
-# Any LiteLLM-supported model works. For an OpenAI-compatible endpoint
-# (vLLM, Ollama, LocalAI, etc.) set OPENAI_API_BASE + OPENAI_API_KEY
-# in `.env`; for Anthropic set ANTHROPIC_API_KEY. See `.env.example`.
-LLM_MODEL = os.environ.get("LLM_MODEL", "openai/cyankiwi/Qwen3.6-27B-AWQ-INT4")
+# Required env var. Any LiteLLM-supported model works. For an
+# OpenAI-compatible endpoint (vLLM, Ollama, LocalAI, etc.) set
+# OPENAI_API_BASE + OPENAI_API_KEY in `.env`; for Anthropic set
+# ANTHROPIC_API_KEY. See `.env.example` for the full menu.
+LLM_MODEL = os.environ.get("LLM_MODEL")
+if not LLM_MODEL:
+    raise SystemExit(
+        "LLM_MODEL is not set. Copy skill_based/.env.example to "
+        "skill_based/.env and uncomment exactly one LLM_MODEL line."
+    )
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", LLM_MODEL)
 
 
