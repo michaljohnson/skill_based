@@ -124,7 +124,10 @@ async def run(
         )
 
     # Step 2 — Drive to entry pose.
-    NAV_WALL_TIMEOUT = 90.0
+    # Wall-timeout sized for slow Gazebo RTF; matches multi_agent's
+    # 180s budget so cross-architecture comparisons aren't biased by
+    # timeout differences.
+    NAV_WALL_TIMEOUT = 180.0
     try:
         await asyncio.wait_for(
             mcp.call_tool_prefixed(
