@@ -5,7 +5,7 @@ Usage:
     python3 -m skill_based.main --task "pick up the coke can on the kitchen table and bring it to the trash bin"
     python3 -m skill_based.main --test-pick "red coke can"
     python3 -m skill_based.main --test-place "trash bin"
-    python3 -m skill_based.main --test-approach "kitchen" --target-object "wooden coffee table"
+    python3 -m skill_based.main --test-approach "kitchen" --object-name "wooden coffee table"
 """
 
 import argparse
@@ -57,15 +57,15 @@ async def test_pick(object_name: str) -> None:
 
 
 async def test_place(
-    target_container: str,
+    target_location: str,
     object_name: str,
 ) -> None:
-    print(f"\n=== Testing place skill: target='{target_container}' object='{object_name}' ===\n")
+    print(f"\n=== Testing place skill: target='{target_location}' object='{object_name}' ===\n")
     async with MCPClient() as mcp:
         t0 = time.perf_counter()
         result = await place_skill.run(
             mcp=mcp,
-            target_container=target_container,
+            target_location=target_location,
             object_name=object_name,
         )
         result["wall_seconds"] = round(time.perf_counter() - t0, 2)
@@ -74,19 +74,19 @@ async def test_place(
 
 
 async def test_approach(
-    destination: str,
+    target_area: str,
     next_action: str,
-    target_object: str,
+    object_name: str,
 ) -> None:
-    print(f"\n=== Testing approach skill: '{destination}' (next_action={next_action}) ===")
-    print(f"    Target object: '{target_object}'")
+    print(f"\n=== Testing approach skill: '{target_area}' (next_action={next_action}) ===")
+    print(f"    Target object: '{object_name}'")
     async with MCPClient() as mcp:
         t0 = time.perf_counter()
         result = await approach_skill.run(
             mcp=mcp,
-            destination=destination,
+            target_area=target_area,
             next_action=next_action,
-            target_object=target_object,
+            object_name=object_name,
         )
         result["wall_seconds"] = round(time.perf_counter() - t0, 2)
         print(f"\n=== Result ===")
@@ -135,7 +135,7 @@ def main() -> None:
         nargs="+",
         metavar="DEST",
         default=None,
-        help="Test approach skill to DEST (no planner). Combine with --next-action and optionally --target-object.",
+        help="Test approach skill to DEST (no planner). Combine with --next-action and optionally --object-name.",
     )
     parser.add_argument(
         "--next-action",
@@ -145,7 +145,7 @@ def main() -> None:
         help="What the planner intends to do after the approach (selects standoff distance). Used with --test-approach.",
     )
     parser.add_argument(
-        "--target-object",
+        "--object-name",
         type=str,
         default=None,
         help="Target object (e.g. 'wooden coffee table'). Required with --test-approach and --test-place.",
@@ -197,14 +197,14 @@ def main() -> None:
     if args.test_pick:
         asyncio.run(test_pick(args.test_pick))
     elif args.test_place:
-        if not args.target_object:
-            parser.error("--test-place requires --target-object (the held object's name)")
-        asyncio.run(test_place(args.test_place, args.target_object))
+        if not args.object_name:
+            parser.error("--test-place requires --object-name (the held object's name)")
+        asyncio.run(test_place(args.test_place, args.object_name))
     elif args.test_approach:
-        if not args.target_object:
-            parser.error("--test-approach requires --target-object")
+        if not args.object_name:
+            parser.error("--test-approach requires --object-name")
         dest = " ".join(args.test_approach)
-        asyncio.run(test_approach(dest, args.next_action, args.target_object))
+        asyncio.run(test_approach(dest, args.next_action, args.object_name))
     elif args.task:
         asyncio.run(run_full(args.task))
     else:

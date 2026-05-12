@@ -245,10 +245,10 @@ async def _verify_object_no_longer_visible(
 
 async def run(
     mcp: MCPClient,
-    target_container: str,
+    target_location: str,
     object_name: str,
 ) -> dict:
-    """Release the held object onto/into ``target_container``.
+    """Release the held object onto/into ``target_location``.
 
     Preconditions: robot is holding an object (gripper attached) and is
     positioned within working distance of the target. The approach skill
@@ -256,7 +256,7 @@ async def run(
 
     Args:
         mcp: shared MCP client.
-        target_container: name of the surface or container.
+        target_location: name of the surface or container.
         object_name: name of the held object. Required because (a) the
             post-release visibility verify needs it to segment the right
             object on the front cam, and (b) the object-height lookup
@@ -264,15 +264,15 @@ async def run(
             both checks silently degrade, so the contract requires it.
 
     Returns:
-        ``{"success": bool, "reason": str, "target_container": str, "tool_calls_used": int}``
+        ``{"success": bool, "reason": str, "target_location": str, "tool_calls_used": int}``
     """
     if not object_name:
         raise ValueError("object_name must be a non-empty string")
 
     tool_calls = 0
-    base_result = {"target_container": target_container}
+    base_result = {"target_location": target_location}
 
-    if "floor" in target_container.lower():
+    if "floor" in target_location.lower():
         return {
             **base_result,
             "success": False,
@@ -284,10 +284,10 @@ async def run(
             "tool_calls_used": tool_calls,
         }
 
-    is_container = _looks_like_container(target_container)
+    is_container = _looks_like_container(target_location)
     object_height_m = _resolve_object_height(object_name) if not is_container else 0.0
     logger.info(
-        f"place -> target='{target_container}' object='{object_name}' "
+        f"place -> target='{target_location}' object='{object_name}' "
         f"mode={'container' if is_container else 'surface'} "
         f"obj_h={object_height_m:.2f}m"
     )
@@ -329,7 +329,7 @@ async def run(
     # to the ARM camera at look_forward — the held object blocks the
     # centre of the frame but the target's upper portion is usually
     # visible above the gripper.
-    fallbacks = geometric_fallback_prompts(target_container)
+    fallbacks = geometric_fallback_prompts(target_location)
     seg_ok = False
     seg_camera = "front"
     last_status = "ERROR"
@@ -354,7 +354,7 @@ async def run(
             **base_result,
             "success": False,
             "reason": (
-                f"both-camera segmentation failed for '{target_container}' "
+                f"both-camera segmentation failed for '{target_location}' "
                 f"and fallbacks {fallbacks[1:]}"
             ),
             "tool_calls_used": tool_calls,
@@ -367,7 +367,7 @@ async def run(
     )
     coarse, calls = await _placing_pose(
         mcp,
-        target_container,
+        target_location,
         surface=not is_container,
         object_height_m=object_height_m,
         pointcloud_topic=pc_topic,
@@ -403,13 +403,13 @@ async def run(
         ok2, info2, calls = await _plan_to_xyz(mcp, cx, cy, cz + 0.30)
         tool_calls += calls
         if ok2:
-            status, calls = await _segment(mcp, target_container, camera="arm")
+            status, calls = await _segment(mcp, target_location, camera="arm")
             tool_calls += calls
             logger.info(f"  [place] stage-2 arm SAM3 -> {status}")
             if status == "SUCCESS":
                 refined, calls = await _placing_pose(
                     mcp,
-                    target_container,
+                    target_location,
                     surface=False,
                     object_height_m=0.0,
                     pointcloud_topic="/segmented_pointcloud",
@@ -520,7 +520,7 @@ async def run(
         return {
             **base_result,
             "success": True,
-            "reason": f"placed in {target_container}: {vinfo}",
+            "reason": f"placed in {target_location}: {vinfo}",
             "tool_calls_used": tool_calls,
         }
 
@@ -528,7 +528,7 @@ async def run(
         **base_result,
         "success": True,
         "reason": (
-            f"placed on {target_container} at ({place_x:.2f},{place_y:.2f},{place_z:.2f})"
+            f"placed on {target_location} at ({place_x:.2f},{place_y:.2f},{place_z:.2f})"
         ),
         "tool_calls_used": tool_calls,
     }

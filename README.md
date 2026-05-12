@@ -62,8 +62,8 @@ cp skill_based/.env.example skill_based/.env
 
 # Single-skill smoke tests (assume robot is pre-positioned for pick/place):
 python3 -m skill_based.main --test-pick "red coke can"
-python3 -m skill_based.main --test-place "trash bin" --target-object "red coke can"
-python3 -m skill_based.main --test-approach "kitchen" --next-action pick --target-object "wooden coffee table"
+python3 -m skill_based.main --test-place "trash bin" --object-name "red coke can"
+python3 -m skill_based.main --test-approach "kitchen" --next-action pick --object-name "wooden coffee table"
 
 # Full planner loop:
 python3 -m skill_based.main --task "pick up the red coke can in the kitchen and place it on the wooden coffee table in the living room"

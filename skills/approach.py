@@ -1,9 +1,9 @@
 """Approach skill — deterministic Python find-and-approach primitive.
 
-The skill takes a named destination, an optional target object, and a
+The skill takes a named target_area, an optional target object, and a
 ``next_action`` flag that selects standoff distance. It tucks the arm,
-drives the base to the entry pose for the destination, waits for the
-base to settle, and (when ``target_object`` is given) refines the
+drives the base to the entry pose for the target_area, waits for the
+base to settle, and (when ``object_name`` is given) refines the
 approach via ``approach_target`` plus a fall-back ``spin_search``.
 
 The four-phase contract (coarse drive → area settle → target search →
@@ -53,28 +53,28 @@ NAMED_AREA_POSES: dict[str, dict[str, float]] = {
 }
 
 
-def _resolve_destination(name: str) -> dict[str, float] | None:
+def _resolve_target_area(name: str) -> dict[str, float] | None:
     key = " ".join(name.lower().replace("_", " ").split())
     return NAMED_AREA_POSES.get(key)
 
 
 async def run(
     mcp: MCPClient,
-    destination: str,
+    target_area: str,
     next_action: str,
-    target_object: str,
+    object_name: str,
 ) -> dict:
-    """Drive the robot to ``destination`` and approach ``target_object``.
+    """Drive the robot to ``target_area`` and approach ``object_name``.
 
     Args:
         mcp: shared MCP client.
-        destination: named area key (must be in ``NAMED_AREA_POSES``).
+        target_area: named area key (must be in ``NAMED_AREA_POSES``).
         next_action: one of ``pick``, ``surface_place``, ``container_place``,
             ``floor_place``; declares what the planner intends to do
             immediately after this skill returns. Selects the standoff
             for the approach refinement.
-        target_object: surface or object to approach within the
-            destination. The skill segments it on the front camera, drives
+        object_name: surface or object to approach within the
+            target_area. The skill segments it on the front camera, drives
             to standoff, and falls back to spin-search if the first
             segmentation misses. The skill is named ``approach`` because
             it always approaches a specific named target. For pure
@@ -84,8 +84,8 @@ async def run(
     Returns:
         ``{"success": bool, "reason": str, "tool_calls_used": int}``
     """
-    if not target_object:
-        raise ValueError("target_object must be a non-empty string")
+    if not object_name:
+        raise ValueError("object_name must be a non-empty string")
 
     tool_calls = 0
 
@@ -96,12 +96,12 @@ async def run(
             "tool_calls_used": tool_calls,
         }
 
-    pose = _resolve_destination(destination)
+    pose = _resolve_target_area(target_area)
     if pose is None:
         return {
             "success": False,
             "reason": (
-                f"unknown destination '{destination}'; known: "
+                f"unknown target_area '{target_area}'; known: "
                 f"{sorted(NAMED_AREA_POSES.keys())}"
             ),
             "tool_calls_used": tool_calls,
@@ -109,8 +109,8 @@ async def run(
 
     standoff_m = STANDOFF_BY_NEXT_ACTION[next_action]
     logger.info(
-        f"approach -> dest='{destination}' next_action={next_action} "
-        f"standoff={standoff_m:.2f}m target='{target_object}'"
+        f"approach -> dest='{target_area}' next_action={next_action} "
+        f"standoff={standoff_m:.2f}m target='{object_name}'"
     )
 
     # Step 1 — Tuck arm. A low arm reads as an obstacle in the front
@@ -174,7 +174,7 @@ async def run(
     # Step 4 — Verify target visibility (front cam at standoff). Try the
     # literal target first, then geometric fallback prompts before falling
     # back to spin-search.
-    prompts = geometric_fallback_prompts(target_object)
+    prompts = geometric_fallback_prompts(object_name)
     status = "ERROR"
     for prompt in prompts:
         try:
@@ -194,20 +194,20 @@ async def run(
 
     if status != "SUCCESS":
         # Spin-search to bring target into view (also tries fallback prompts per spin)
-        spin = await spin_search(mcp, target_object, max_spins=6, camera="front")
+        spin = await spin_search(mcp, object_name, max_spins=6, camera="front")
         tool_calls += spin.get("tool_calls_used", 0)
         if not spin.get("success"):
             return {
                 "success": False,
                 "reason": (
-                    f"target '{target_object}' not visible after spin-search "
-                    f"at '{destination}'"
+                    f"target '{object_name}' not visible after spin-search "
+                    f"at '{target_area}'"
                 ),
                 "tool_calls_used": tool_calls,
             }
 
     # Step 5 — Drive to standoff distance from segmented target.
-    approach = await approach_target(mcp, target_object, standoff_m=standoff_m)
+    approach = await approach_target(mcp, object_name, standoff_m=standoff_m)
     tool_calls += approach.get("tool_calls_used", 0)
     if not approach.get("success"):
         # Approach failed but the target was visible; report partial
@@ -215,7 +215,7 @@ async def run(
         return {
             "success": False,
             "reason": (
-                f"target '{target_object}' visible but approach to "
+                f"target '{object_name}' visible but approach to "
                 f"{standoff_m:.2f}m failed: {approach.get('reason')}"
             ),
             "tool_calls_used": tool_calls,
@@ -228,7 +228,7 @@ async def run(
     return {
         "success": True,
         "reason": (
-            f"approached '{target_object}' in '{destination}' "
+            f"approached '{object_name}' in '{target_area}' "
             f"to {standoff_m:.2f}m standoff: {approach.get('reason')}"
         ),
         "tool_calls_used": tool_calls,

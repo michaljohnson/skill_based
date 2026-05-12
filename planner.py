@@ -75,14 +75,14 @@ PLANNER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "destination": {
+                    "target_area": {
                         "type": "string",
                         "description": "Named area (e.g. 'kitchen', 'living room', 'kids room', 'bedroom').",
                     },
-                    "target_object": {
+                    "object_name": {
                         "type": "string",
                         "description": (
-                            "Surface or object to approach within the destination "
+                            "Surface or object to approach within the target_area "
                             "(e.g. 'wooden coffee table', 'trash bin'). Required: "
                             "the skill always approaches a specific named target. "
                             "For pure relocation use a dedicated skill instead of "
@@ -95,7 +95,7 @@ PLANNER_TOOLS = [
                         "description": "What the planner intends to do immediately after this call. Controls the approach standoff distance.",
                     },
                 },
-                "required": ["destination", "target_object", "next_action"],
+                "required": ["target_area", "object_name", "next_action"],
             },
         },
     },
@@ -132,7 +132,7 @@ PLANNER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target_container": {
+                    "target_location": {
                         "type": "string",
                         "description": "Surface or container to place into (e.g. 'kitchen table', 'trash bin').",
                     },
@@ -145,7 +145,7 @@ PLANNER_TOOLS = [
                         ),
                     },
                 },
-                "required": ["target_container", "object_name"],
+                "required": ["target_location", "object_name"],
             },
         },
     },
@@ -159,9 +159,9 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
     if name == "approach":
         return await approach_skill.run(
             mcp=mcp,
-            destination=args["destination"],
+            target_area=args["target_area"],
             next_action=args["next_action"],
-            target_object=args["target_object"],
+            object_name=args["object_name"],
         )
     if name == "pick":
         return await pick_skill.run(
@@ -171,7 +171,7 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
     if name == "place":
         return await place_skill.run(
             mcp=mcp,
-            target_container=args["target_container"],
+            target_location=args["target_location"],
             object_name=args["object_name"],
         )
     return {"success": False, "reason": f"unknown skill: {name}"}
