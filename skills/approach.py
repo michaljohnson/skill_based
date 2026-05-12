@@ -1,10 +1,16 @@
-"""Navigate skill — deterministic Python navigation primitive.
+"""Approach skill — deterministic Python find-and-approach primitive.
 
 The skill takes a named destination, an optional target object, and a
 mode that selects standoff distance. It tucks the arm, drives the base
 to the entry pose for the destination, waits for the base to settle,
 and (when ``target_object`` is given) refines the approach via
 ``approach_target`` plus a fall-back ``spin_search``.
+
+The four-phase contract (coarse drive → area settle → target search →
+fine approach to standoff) is the reason this skill is named ``approach``
+rather than ``navigate``: it does substantially more than pose-to-pose
+navigation, and ``approach`` reads naturally alongside ``pick`` and
+``place`` in the planner's tool list.
 
 The planner LLM never sees the underlying MCP tools; it only sees this
 skill's signature and the structured success/failure result.
@@ -96,7 +102,7 @@ async def run(
 
     standoff_m = STANDOFF_BY_MODE[mode]
     logger.info(
-        f"navigate -> dest='{destination}' mode={mode} "
+        f"approach -> dest='{destination}' mode={mode} "
         f"standoff={standoff_m:.2f}m target='{target_object}'"
     )
 
@@ -226,7 +232,7 @@ async def run(
     return {
         "success": True,
         "reason": (
-            f"navigated to '{destination}' and approached '{target_object}' "
+            f"approached '{target_object}' in '{destination}' "
             f"to {standoff_m:.2f}m standoff: {approach.get('reason')}"
         ),
         "tool_calls_used": tool_calls,

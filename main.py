@@ -5,7 +5,7 @@ Usage:
     python3 -m skill_based.main --task "pick up the coke can on the kitchen table and bring it to the trash bin"
     python3 -m skill_based.main --test-pick "red coke can"
     python3 -m skill_based.main --test-place "trash bin"
-    python3 -m skill_based.main --test-navigate "kitchen" --target-object "wooden coffee table"
+    python3 -m skill_based.main --test-approach "kitchen" --target-object "wooden coffee table"
 """
 
 import argparse
@@ -22,7 +22,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from skill_based.clients.mcp import MCPClient
 from skill_based.planner import run_planner
-from skill_based.skills import navigate as navigate_skill
+from skill_based.skills import approach as approach_skill
 from skill_based.skills import pick as pick_skill
 from skill_based.skills import place as place_skill
 
@@ -67,17 +67,17 @@ async def test_place(
         print(json.dumps(result, indent=2))
 
 
-async def test_navigate(
+async def test_approach(
     destination: str,
     mode: str,
     target_object: str | None = None,
 ) -> None:
-    print(f"\n=== Testing navigate skill: '{destination}' (mode={mode}) ===")
+    print(f"\n=== Testing approach skill: '{destination}' (mode={mode}) ===")
     if target_object:
         print(f"    Target object: '{target_object}'")
     async with MCPClient() as mcp:
         t0 = time.perf_counter()
-        result = await navigate_skill.run(
+        result = await approach_skill.run(
             mcp=mcp,
             destination=destination,
             mode=mode,
@@ -125,25 +125,25 @@ def main() -> None:
         help="Test place skill on a single target (no planner). Robot must be holding an object.",
     )
     parser.add_argument(
-        "--test-navigate",
+        "--test-approach",
         type=str,
         nargs="+",
         metavar="DEST",
         default=None,
-        help="Test navigate skill to DEST (no planner). Combine with --mode and optionally --target-object.",
+        help="Test approach skill to DEST (no planner). Combine with --mode and optionally --target-object.",
     )
     parser.add_argument(
         "--mode",
         type=str,
         choices=["pick", "surface_place", "container_place"],
         default="pick",
-        help="Navigation mode (selects standoff distance). Used with --test-navigate.",
+        help="Approach mode (selects standoff distance). Used with --test-approach.",
     )
     parser.add_argument(
         "--target-object",
         type=str,
         default=None,
-        help="Optional target object for navigator (e.g. 'wooden coffee table')",
+        help="Optional target object for approach skill (e.g. 'wooden coffee table')",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -162,7 +162,7 @@ def main() -> None:
         class _SkillTagFormatter(logging.Formatter):
             _TAGS = {
                 "skill_based.planner":   "[PLANNER] ",
-                "skill_based.skills.navigate": "[NAVIGATE]",
+                "skill_based.skills.approach": "[APPROACH]",
                 "skill_based.skills.pick":     "[PICK]    ",
                 "skill_based.skills.place":    "[PLACE]   ",
                 "skill_based.skills.common":   "[COMMON]  ",
@@ -193,15 +193,15 @@ def main() -> None:
         asyncio.run(test_pick(args.test_pick))
     elif args.test_place:
         asyncio.run(test_place(args.test_place, args.target_object))
-    elif args.test_navigate:
-        dest = " ".join(args.test_navigate)
-        asyncio.run(test_navigate(dest, args.mode, args.target_object))
+    elif args.test_approach:
+        dest = " ".join(args.test_approach)
+        asyncio.run(test_approach(dest, args.mode, args.target_object))
     elif args.task:
         asyncio.run(run_full(args.task))
     else:
         parser.error(
             "no action specified — pass --task, --test-pick, --test-place, "
-            "or --test-navigate"
+            "or --test-approach"
         )
 
 

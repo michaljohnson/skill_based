@@ -1,6 +1,6 @@
 # Skill-based architecture
 
-A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks. Inspired by the CaP-X programmatic skill-abstraction pattern (Fu et al., 2026), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `navigate`, `pick`, and `place`, and a planner LLM decides which skill to call next.
+A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks. Inspired by the CaP-X programmatic skill-abstraction pattern (Fu et al., 2026), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
 
 Originally built as one of three architectures compared in a BA thesis on "where the policy should live" in agentic robotics; released so others can reuse the pattern.
 
@@ -35,12 +35,12 @@ The MCP servers are not part of this package; you bring your own. The architectu
 
 ```
 skill_based/
-  main.py                  CLI entry (--task / --test-{pick,place,navigate})
+  main.py                  CLI entry (--task / --test-{pick,place,approach})
   planner.py               planner LLM agent + skill dispatch
   planner.md               planner system prompt (loaded by planner.py)
   skills/                  deterministic Python skills (the architecture's middle layer)
     __init__.py
-    navigate.py            nav2 + approach sequence
+    approach.py            nav2 + four-phase find-and-approach sequence
     pick.py                grasp pipeline
     place.py               release pipeline
     common.py              shared helpers (approach_target, AMCL re-seed, gripper-status wait, segmentation fallback chain)
@@ -63,7 +63,7 @@ cp skill_based/.env.example skill_based/.env
 # Single-skill smoke tests (assume robot is pre-positioned for pick/place):
 python3 -m skill_based.main --test-pick "red coke can"
 python3 -m skill_based.main --test-place "trash bin" --target-object "red coke can"
-python3 -m skill_based.main --test-navigate "kitchen" --mode pick --target-object "wooden coffee table"
+python3 -m skill_based.main --test-approach "kitchen" --mode pick --target-object "wooden coffee table"
 
 # Full planner loop:
 python3 -m skill_based.main --task "pick up the red coke can in the kitchen and place it on the wooden coffee table in the living room"
@@ -73,7 +73,7 @@ python3 -m skill_based.main --task "pick up the red coke can in the kitchen and 
 
 ## How a turn works
 
-1. The planner LLM receives the system prompt (`planner.md`), the user task, and three tool schemas (`navigate`, `pick`, `place`).
+1. The planner LLM receives the system prompt (`planner.md`), the user task, and three tool schemas (`approach`, `pick`, `place`).
 2. The planner emits a tool call. LiteLLM routes it back through `clients/llm.py`. If the model is served by a vLLM without the Hermes tool-call parser flag, a client-side parser extracts the tool call from `message.content`.
 3. `planner.py` dispatches the call to the matching deterministic skill in `skills/`.
 4. The skill runs its canonical MCP-tool sequence (typically 5–20 calls), returns `{success: bool, reason: str, tool_calls_used: int, ...}`.
@@ -85,7 +85,7 @@ The planner does NOT see the underlying MCP tool surface. The skills do not call
 
 The skills assume specific MCP tool names (e.g. `perception__segment_objects`, `nav2__approach_target`, `moveit__plan_and_execute`). If your MCP servers expose different names, edit the calls inside `skills/*.py`. The architectural pattern (planner → deterministic skill → MCP tool) is independent of the specific tool names; only the strings need updating.
 
-The hardcoded entry-pose table in `skills/navigate.py` is keyed to a particular simulated home environment. Replace with your own room/area coordinates.
+The hardcoded entry-pose table in `skills/approach.py` is keyed to a particular simulated home environment. Replace with your own room/area coordinates.
 
 ## Design decisions
 

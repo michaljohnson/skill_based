@@ -2,7 +2,7 @@
 
 The planner is a (typically small, open-weights) LLM that receives a
 natural-language task instruction and decides which deterministic skill
-to invoke next: ``navigate``, ``pick``, or ``place``. It does NOT see
+to invoke next: ``approach``, ``pick``, or ``place``. It does NOT see
 the underlying MCP tool surface; its decision space is the three skills
 and their parameters.
 
@@ -32,7 +32,7 @@ from skill_based.clients.llm import (
     wants_tool_use,
 )
 from skill_based.clients.mcp import MCPClient
-from skill_based.skills import navigate as navigate_skill
+from skill_based.skills import approach as approach_skill
 from skill_based.skills import pick as pick_skill
 from skill_based.skills import place as place_skill
 
@@ -56,7 +56,7 @@ PLANNER_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "navigate",
+            "name": "approach",
             "description": (
                 "Move the robot base to a named area, optionally approaching a target object. "
                 "Returns success when the robot is positioned within working distance of the target."
@@ -92,7 +92,7 @@ PLANNER_TOOLS = [
             "description": (
                 "Grasp the named object from the surface or floor in front of the robot. "
                 "Assumes the robot is already positioned within working distance "
-                "(call navigate first). Returns success only when /gripper/status confirms attachment."
+                "(call approach first). Returns success only when /gripper/status confirms attachment."
             ),
             "parameters": {
                 "type": "object",
@@ -138,8 +138,8 @@ PLANNER_TOOLS = [
 
 async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
     """Route a planner skill call to the corresponding Python implementation."""
-    if name == "navigate":
-        return await navigate_skill.run(
+    if name == "approach":
+        return await approach_skill.run(
             mcp=mcp,
             destination=args["destination"],
             mode=args["mode"],
