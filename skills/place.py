@@ -246,24 +246,29 @@ async def _verify_object_no_longer_visible(
 async def run(
     mcp: MCPClient,
     target_container: str,
-    object_name: str | None = None,
+    object_name: str,
 ) -> dict:
     """Release the held object onto/into ``target_container``.
 
     Preconditions: robot is holding an object (gripper attached) and is
-    positioned within working distance of the target. The navigator owns
-    positioning; place is a pure manipulation primitive.
+    positioned within working distance of the target. The approach skill
+    owns positioning; place is a pure manipulation primitive.
 
     Args:
         mcp: shared MCP client.
         target_container: name of the surface or container.
-        object_name: name of the held object (used for object-height
-            lookup in surface mode and for the post-release visibility
-            verify in container mode).
+        object_name: name of the held object. Required because (a) the
+            post-release visibility verify needs it to segment the right
+            object on the front cam, and (b) the object-height lookup
+            table in surface-place mode keys off it. Without ``object_name``
+            both checks silently degrade, so the contract requires it.
 
     Returns:
         ``{"success": bool, "reason": str, "target_container": str, "tool_calls_used": int}``
     """
+    if not object_name:
+        raise ValueError("object_name must be a non-empty string")
+
     tool_calls = 0
     base_result = {"target_container": target_container}
 
@@ -500,7 +505,7 @@ async def run(
         )
 
     # Step 13 — for containers, post-release visibility check
-    if is_container and object_name:
+    if is_container:
         visible_ok, vinfo, calls = await _verify_object_no_longer_visible(
             mcp, object_name
         )

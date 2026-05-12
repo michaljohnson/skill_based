@@ -62,9 +62,9 @@ async def run(
     mcp: MCPClient,
     destination: str,
     next_action: str,
-    target_object: str | None = None,
+    target_object: str,
 ) -> dict:
-    """Drive the robot to ``destination``, optionally approaching ``target_object``.
+    """Drive the robot to ``destination`` and approach ``target_object``.
 
     Args:
         mcp: shared MCP client.
@@ -72,15 +72,21 @@ async def run(
         next_action: one of ``pick``, ``surface_place``, ``container_place``,
             ``floor_place``; declares what the planner intends to do
             immediately after this skill returns. Selects the standoff
-            for the optional approach refinement.
-        target_object: optional surface or object to approach within the
-            destination. When given, the skill segments it on the front
-            camera, drives to standoff, and falls back to spin-search if
-            the first segmentation misses.
+            for the approach refinement.
+        target_object: surface or object to approach within the
+            destination. The skill segments it on the front camera, drives
+            to standoff, and falls back to spin-search if the first
+            segmentation misses. The skill is named ``approach`` because
+            it always approaches a specific named target. For pure
+            relocation (return-to-home, exploration) add a separate
+            skill rather than overloading this one with optional args.
 
     Returns:
         ``{"success": bool, "reason": str, "tool_calls_used": int}``
     """
+    if not target_object:
+        raise ValueError("target_object must be a non-empty string")
+
     tool_calls = 0
 
     if next_action not in STANDOFF_BY_NEXT_ACTION:
@@ -165,18 +171,7 @@ async def run(
     # Step 3 — Settle on /odom.
     await wait_until_still(mcp, timeout=4.0)
 
-    # Step 4 — If no target_object, navigation succeeds at entry pose.
-    if not target_object:
-        return {
-            "success": True,
-            "reason": (
-                f"arrived at '{destination}' entry pose "
-                f"({pose['x']:.2f},{pose['y']:.2f},{pose['yaw']:.2f})"
-            ),
-            "tool_calls_used": tool_calls,
-        }
-
-    # Step 5 — Verify target visibility (front cam at standoff). Try the
+    # Step 4 — Verify target visibility (front cam at standoff). Try the
     # literal target first, then geometric fallback prompts before falling
     # back to spin-search.
     prompts = geometric_fallback_prompts(target_object)
@@ -211,7 +206,7 @@ async def run(
                 "tool_calls_used": tool_calls,
             }
 
-    # Step 6 — Drive to standoff distance from segmented target.
+    # Step 5 — Drive to standoff distance from segmented target.
     approach = await approach_target(mcp, target_object, standoff_m=standoff_m)
     tool_calls += approach.get("tool_calls_used", 0)
     if not approach.get("success"):
@@ -226,7 +221,7 @@ async def run(
             "tool_calls_used": tool_calls,
         }
 
-    # Step 7 — Final stillness wait so downstream perception sees a
+    # Step 6 — Final stillness wait so downstream perception sees a
     # stationary scene.
     await wait_until_still(mcp, timeout=3.0)
 

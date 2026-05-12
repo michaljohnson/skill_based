@@ -58,7 +58,7 @@ async def test_pick(object_name: str) -> None:
 
 async def test_place(
     target_container: str,
-    object_name: str | None = None,
+    object_name: str,
 ) -> None:
     print(f"\n=== Testing place skill: target='{target_container}' object='{object_name}' ===\n")
     async with MCPClient() as mcp:
@@ -76,11 +76,10 @@ async def test_place(
 async def test_approach(
     destination: str,
     next_action: str,
-    target_object: str | None = None,
+    target_object: str,
 ) -> None:
     print(f"\n=== Testing approach skill: '{destination}' (next_action={next_action}) ===")
-    if target_object:
-        print(f"    Target object: '{target_object}'")
+    print(f"    Target object: '{target_object}'")
     async with MCPClient() as mcp:
         t0 = time.perf_counter()
         result = await approach_skill.run(
@@ -149,7 +148,7 @@ def main() -> None:
         "--target-object",
         type=str,
         default=None,
-        help="Optional target object for approach skill (e.g. 'wooden coffee table')",
+        help="Target object (e.g. 'wooden coffee table'). Required with --test-approach and --test-place.",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -198,8 +197,12 @@ def main() -> None:
     if args.test_pick:
         asyncio.run(test_pick(args.test_pick))
     elif args.test_place:
+        if not args.target_object:
+            parser.error("--test-place requires --target-object (the held object's name)")
         asyncio.run(test_place(args.test_place, args.target_object))
     elif args.test_approach:
+        if not args.target_object:
+            parser.error("--test-approach requires --target-object")
         dest = " ".join(args.test_approach)
         asyncio.run(test_approach(dest, args.next_action, args.target_object))
     elif args.task:

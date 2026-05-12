@@ -82,8 +82,11 @@ PLANNER_TOOLS = [
                     "target_object": {
                         "type": "string",
                         "description": (
-                            "Optional. Surface or object to approach within the destination "
-                            "(e.g. 'wooden coffee table', 'trash bin')."
+                            "Surface or object to approach within the destination "
+                            "(e.g. 'wooden coffee table', 'trash bin'). Required: "
+                            "the skill always approaches a specific named target. "
+                            "For pure relocation use a dedicated skill instead of "
+                            "this one."
                         ),
                     },
                     "next_action": {
@@ -92,7 +95,7 @@ PLANNER_TOOLS = [
                         "description": "What the planner intends to do immediately after this call. Controls the approach standoff distance.",
                     },
                 },
-                "required": ["destination", "next_action"],
+                "required": ["destination", "target_object", "next_action"],
             },
         },
     },
@@ -135,10 +138,14 @@ PLANNER_TOOLS = [
                     },
                     "object_name": {
                         "type": "string",
-                        "description": "Optional. Object currently held; used for verification.",
+                        "description": (
+                            "Name of the held object. Required: used for "
+                            "object-height lookup in surface mode and for the "
+                            "post-release visibility verify in container mode."
+                        ),
                     },
                 },
-                "required": ["target_container"],
+                "required": ["target_container", "object_name"],
             },
         },
     },
@@ -154,7 +161,7 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
             mcp=mcp,
             destination=args["destination"],
             next_action=args["next_action"],
-            target_object=args.get("target_object"),
+            target_object=args["target_object"],
         )
     if name == "pick":
         return await pick_skill.run(
@@ -165,7 +172,7 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
         return await place_skill.run(
             mcp=mcp,
             target_container=args["target_container"],
-            object_name=args.get("object_name"),
+            object_name=args["object_name"],
         )
     return {"success": False, "reason": f"unknown skill: {name}"}
 
