@@ -32,8 +32,26 @@ logger = logging.getLogger(__name__)
 # UR5e practical reach forward from base_footprint, per pick.md step 5.
 UR5_REACH_X = 1.10
 
-# Top-down grasp orientation in base_footprint (w, x, y, z).
-TOPDOWN_ORIENTATION = [1.0, 0.0, 0.0, 0.0]
+# Default top-down quaternion as (x, y, z, w). Used only as a fallback
+# when the perception MCP cannot return a shape-aware orientation
+# (e.g. on an intermediate recovery lift after the grasp pose has been
+# consumed). Real picks use the orientation from get_topdown_grasp_pose,
+# which is shape-aware (PCA on the segmented point cloud).
+TOPDOWN_ORIENTATION_DEFAULT = [1.0, 0.0, 0.0, 0.0]
+
+
+def _orientation_to_list(orientation: dict | list) -> list[float]:
+    """Coerce a perception-MCP orientation (dict {x,y,z,w}) to the
+    moveit_mcp__plan_and_execute list form [x, y, z, w]. Pass-through
+    for list inputs."""
+    if isinstance(orientation, dict):
+        return [
+            float(orientation["x"]),
+            float(orientation["y"]),
+            float(orientation["z"]),
+            float(orientation["w"]),
+        ]
+    return [float(v) for v in orientation]
 
 
 async def _gripper_status(mcp: MCPClient, timeout: float = 3.0) -> str:
@@ -120,13 +138,22 @@ async def _plan_to_xyz(
     x: float,
     y: float,
     z: float,
+    orientation: list[float] | None = None,
     *,
     clear_scene_on_retry: bool = True,
 ) -> tuple[bool, str, int]:
-    """Plan + execute a top-down pose, with one clear_planning_scene retry."""
+    """Plan + execute a top-down pose, with one clear_planning_scene retry.
+
+    ``orientation`` is the quaternion as ``[x, y, z, w]``. When omitted,
+    the default top-down orientation (180 deg about X) is used; real
+    picks should pass the shape-aware orientation returned by
+    ``perception__get_topdown_grasp_pose``.
+    """
+    if orientation is None:
+        orientation = TOPDOWN_ORIENTATION_DEFAULT
     target = {
         "position": [x, y, z],
-        "orientation": TOPDOWN_ORIENTATION,
+        "orientation": orientation,
         "frame_id": "base_footprint",
     }
     try:
@@ -266,9 +293,15 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     gy = float(pos["y"])
     gz = float(pos["z"])
     centroid_z = float(grasp["centroid_base_frame"]["z"])
+    grasp_orientation = _orientation_to_list(pose["orientation"])
+    grasp_yaw_deg = float(grasp.get("principal_axis_angle_deg", 0.0))
+    aspect = float(grasp.get("principal_axis_aspect_ratio", 1.0))
+    oriented = bool(grasp.get("oriented", False))
     logger.info(
         f"  [pick] grasp x={gx:.3f} y={gy:.3f} z={gz:.3f} "
-        f"centroid_z={centroid_z:.3f}"
+        f"centroid_z={centroid_z:.3f} "
+        f"yaw_deg={grasp_yaw_deg:.1f} aspect={aspect:.2f} "
+        f"oriented={oriented}"
     )
 
     # Step 5 — reach check
@@ -294,8 +327,12 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
             "tool_calls_used": tool_calls,
         }
 
-    # Step 7 — pre-grasp pose (10cm above grasp z)
-    ok, info, calls = await _plan_to_xyz(mcp, gx, gy, gz + 0.10)
+    # Step 7 — pre-grasp pose (20cm above grasp z). Higher clearance
+    # gives a cleaner visual descent and matches the lift height for
+    # a symmetric approach / retreat silhouette.
+    ok, info, calls = await _plan_to_xyz(
+        mcp, gx, gy, gz + 0.20, orientation=grasp_orientation
+    )
     tool_calls += calls
     if not ok:
         return {
@@ -308,7 +345,9 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     # Step 8 — descend to grasp z. If MoveIt reports failure, the attach
     # plugin (proximity-based) may already have fired on contact — check
     # /gripper/status before treating descent as a failure.
-    ok, info, calls = await _plan_to_xyz(mcp, gx, gy, gz, clear_scene_on_retry=False)
+    ok, info, calls = await _plan_to_xyz(
+        mcp, gx, gy, gz, orientation=grasp_orientation, clear_scene_on_retry=False
+    )
     tool_calls += calls
     if not ok:
         status = await _gripper_status(mcp, timeout=3.0)
@@ -354,7 +393,9 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     logger.info(f"  [pick] attached:{attached_model}")
 
     # Step 11 — lift 20cm above grasp
-    ok, info, calls = await _plan_to_xyz(mcp, gx, gy, gz + 0.20)
+    ok, info, calls = await _plan_to_xyz(
+        mcp, gx, gy, gz + 0.20, orientation=grasp_orientation
+    )
     tool_calls += calls
     if not ok:
         # Object is attached — cannot return FAILURE without dropping it.
@@ -384,7 +425,7 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
                     "target_type": "pose",
                     "target": {
                         "position": [gx, gy, max(gz + 0.40, 0.90)],
-                        "orientation": TOPDOWN_ORIENTATION,
+                        "orientation": grasp_orientation,
                         "frame_id": "base_footprint",
                     },
                 },
