@@ -76,10 +76,6 @@ def _extract_hermes_tool_calls(response) -> bool:
         # Strip the parsed XML from content so it doesn't bleed into the
         # planner's transcript when LiteLLM re-serialises this message.
         msg.content = _HERMES_TOOL_CALL_RE.sub("", content).strip() or None
-        logger.info(
-            f"  [llm_client] parsed {len(synthetic)} Hermes tool call(s) "
-            "from text content (vLLM tool-parser not enabled)"
-        )
         return True
     except Exception as e:
         logger.warning(f"  [llm_client] Hermes tool-call parse error: {e}")

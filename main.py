@@ -4,7 +4,9 @@
 Usage:
     python3 -m skill_based.main --task "pick up the coke can on the kitchen table and bring it to the trash bin"
     python3 -m skill_based.main --test-pick "red coke can"
-    python3 -m skill_based.main --test-place "trash bin"
+    python3 -m skill_based.main --test-place "trash bin" --object-name "white cube" --mode container --object-height-m 0
+    python3 -m skill_based.main --test-place "wooden coffee table" --object-name "coke can" --mode surface --object-height-m 0.12
+    python3 -m skill_based.main --test-place "white shoe" --object-name "red shoe" --mode floor --object-height-m 0.10
     python3 -m skill_based.main --test-approach "kitchen" --object-name "wooden coffee table"
 """
 
@@ -59,14 +61,21 @@ async def test_pick(object_name: str) -> None:
 async def test_place(
     target_location: str,
     object_name: str,
+    mode: str,
+    object_height_m: float,
 ) -> None:
-    print(f"\n=== Testing place skill: target='{target_location}' object='{object_name}' ===\n")
+    print(
+        f"\n=== Testing place skill: target='{target_location}' "
+        f"object='{object_name}' mode={mode} obj_h={object_height_m:.2f} ===\n"
+    )
     async with MCPClient() as mcp:
         t0 = time.perf_counter()
         result = await place_skill.run(
             mcp=mcp,
             target_location=target_location,
             object_name=object_name,
+            mode=mode,
+            object_height_m=object_height_m,
         )
         result["wall_seconds"] = round(time.perf_counter() - t0, 2)
         print(f"\n=== Result ===")
@@ -102,7 +111,7 @@ async def run_full(task: str) -> None:
         wall_seconds = round(time.perf_counter() - t0, 2)
         print(f"\n=== Final Report ===")
         print(result["summary"])
-        print(f"\nPlanner turns used:        {result['turns_used']}")
+        print(f"\nPlanner decisions made:    {result['turns_used']}")
         print(f"Skill tool calls total:    {result['skill_tool_calls_total']}")
         print(f"Wall-clock total:          {wall_seconds}s ({wall_seconds / 60:.1f} min)")
 
@@ -151,6 +160,23 @@ def main() -> None:
         help="Target object (e.g. 'wooden coffee table'). Required with --test-approach and --test-place.",
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["container", "surface", "floor"],
+        default=None,
+        help="Place mode. Required with --test-place.",
+    )
+    parser.add_argument(
+        "--object-height-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Held object height in metres (from pick.held_object_height_m). "
+            "Required with --test-place when --mode=surface or --mode=floor. "
+            "Ignored for --mode=container."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose logging",
@@ -165,18 +191,27 @@ def main() -> None:
         )
     else:
         class _SkillTagFormatter(logging.Formatter):
+            # Uppercase [PLANNER] signals the LLM-reasoning agent;
+            # lowercase skill tags signal deterministic Python execution
+            # underneath. Section-break "=== PLANNER decision N/M ===" lines
+            # bracket each planner decision (handled in format() below).
             _TAGS = {
-                "skill_based.planner":   "[PLANNER] ",
-                "skill_based.skills.approach": "[APPROACH]",
-                "skill_based.skills.pick":     "[PICK]    ",
-                "skill_based.skills.place":    "[PLACE]   ",
-                "skill_based.skills.common":   "[COMMON]  ",
-                "skill_based.clients.mcp":      "[MCP]     ",
+                "skill_based.planner":   "[PLANNER]  ",
+                "skill_based.skills.approach": "[approach] ",
+                "skill_based.skills.pick":     "[pick]     ",
+                "skill_based.skills.place":    "[place]    ",
+                "skill_based.clients.mcp":     "[mcp]      ",
             }
 
             def format(self, record: logging.LogRecord) -> str:
-                tag = self._TAGS.get(record.name, f"[{record.name}]")
                 msg = record.getMessage()
+                # Section-break lines (e.g. "=== PLANNER decision 1/30 ===")
+                # are printed without a tag prefix so they stand out as
+                # visual boundaries between planner reasoning and skill
+                # execution.
+                if msg.startswith("==="):
+                    return msg
+                tag = self._TAGS.get(record.name, f"[{record.name}]")
                 if record.levelno >= logging.WARNING:
                     return f"{tag} {record.levelname}: {msg}"
                 return f"{tag} {msg}"
@@ -199,7 +234,19 @@ def main() -> None:
     elif args.test_place:
         if not args.object_name:
             parser.error("--test-place requires --object-name (the held object's name)")
-        asyncio.run(test_place(args.test_place, args.object_name))
+        if not args.mode:
+            parser.error("--test-place requires --mode (container | surface | floor)")
+        if args.mode in ("surface", "floor") and args.object_height_m <= 0:
+            parser.error(
+                f"--test-place --mode={args.mode} requires --object-height-m > 0 "
+                "(measured in metres; from pick.held_object_height_m)"
+            )
+        asyncio.run(test_place(
+            args.test_place,
+            args.object_name,
+            args.mode,
+            args.object_height_m,
+        ))
     elif args.test_approach:
         if not args.object_name:
             parser.error("--test-approach requires --object-name")
