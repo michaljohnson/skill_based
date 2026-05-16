@@ -368,42 +368,69 @@ async def run(
     # Step 3 — Settle on /odom.
     await wait_until_still(mcp, timeout=4.0)
 
-    # Step 4 — Verify target visibility (front cam at standoff). Try the
-    # literal target first, then geometric fallback prompts before falling
-    # back to spin-search.
+    # Step 4 — Verify target visibility. Front cam first (sees the room
+    # from body height, right tool for far targets at standoff distance);
+    # arm cam as fallback (sees the floor immediately in front of the
+    # robot, catches small / low / partially-occluded floor objects that
+    # the front cam misses from the entry pose).
     prompts = geometric_fallback_prompts(object_name)
     status = "ERROR"
-    for prompt in prompts:
-        try:
-            seg_raw = await mcp.call_tool_prefixed(
-                "perception__segment_objects",
-                {"prompt": prompt, "camera": "front", "timeout": 20},
-            )
-            tool_calls += 1
-            status = parse_seg_status(seg_raw)
-            logger.info(f"front-cam SAM3 '{prompt}' -> {status}")
-        except Exception as e:
-            status = "ERROR"
-            logger.error(f"front-cam SAM3 error: {e}")
-            tool_calls += 1
+    seg_camera = "front"
+    for camera_try in ("front", "arm"):
+        for prompt in prompts:
+            try:
+                seg_raw = await mcp.call_tool_prefixed(
+                    "perception__segment_objects",
+                    {"prompt": prompt, "camera": camera_try, "timeout": 20},
+                )
+                tool_calls += 1
+                status = parse_seg_status(seg_raw)
+                logger.info(f"{camera_try}-cam SAM3 '{prompt}' -> {status}")
+            except Exception as e:
+                status = "ERROR"
+                logger.error(f"{camera_try}-cam SAM3 error: {e}")
+                tool_calls += 1
+            if status == "SUCCESS":
+                seg_camera = camera_try
+                break
         if status == "SUCCESS":
             break
 
     if status != "SUCCESS":
-        # Spin-search to bring target into view (also tries fallback prompts per spin)
+        # Spin-search front cam first; if that fails, repeat on arm cam.
         spin = await spin_search(mcp, object_name, max_spins=6, camera="front")
         tool_calls += spin.get("tool_calls_used", 0)
-        if not spin.get("success"):
-            return {
-                "success": False,
-                "reason": (
-                    f"target '{object_name}' not visible after spin-search "
-                    f"at '{target_area}'"
-                ),
-                "tool_calls_used": tool_calls,
-            }
+        if spin.get("success"):
+            seg_camera = "front"
+        else:
+            spin = await spin_search(mcp, object_name, max_spins=6, camera="arm")
+            tool_calls += spin.get("tool_calls_used", 0)
+            if not spin.get("success"):
+                return {
+                    "success": False,
+                    "reason": (
+                        f"target '{object_name}' not visible after spin-search "
+                        f"on front+arm cams at '{target_area}'"
+                    ),
+                    "tool_calls_used": tool_calls,
+                }
+            seg_camera = "arm"
 
     # Step 5 — Drive to standoff distance from segmented target.
+    # If detection happened on the arm cam, the robot is already at close
+    # range (arm cam sees within ~0.6m); approach_target reads the front
+    # cam's pointcloud cache and would have nothing to plan against. Skip
+    # the drive and report success at current pose so pick can proceed.
+    if seg_camera == "arm":
+        await wait_until_still(mcp, timeout=2.0)
+        return {
+            "success": True,
+            "reason": (
+                f"'{object_name}' detected on arm cam at '{target_area}'; "
+                f"already at close range, skipping standoff drive"
+            ),
+            "tool_calls_used": tool_calls,
+        }
     approach = await approach_target(mcp, object_name, standoff_m=standoff_m)
     tool_calls += approach.get("tool_calls_used", 0)
     if not approach.get("success"):
