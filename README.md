@@ -18,6 +18,13 @@ The headline claim: ~60 MCP tools across 4 servers are never exposed to the plan
 
 The smaller-model + smarter-skills pairing is this architecture's design point, not a confound. Any LiteLLM-supported model works; see `.env.example`.
 
+Validated end-to-end with two planner sizes on the same pick-and-place task:
+
+- a small open-weights model with a **16k** context window, and
+- a frontier model with a **131k** context window.
+
+Both completed the task successfully. The planner emits one tool call per turn over a short conversation, so context length is not the binding constraint — the deterministic skills absorb the long-horizon reasoning load that would otherwise push context.
+
 ## Requirements
 
 - Python 3.10+
@@ -41,9 +48,10 @@ skill_based/
   skills/                  deterministic Python skills (the architecture's middle layer)
     __init__.py
     approach.py            nav2 + four-phase find-and-approach sequence
-    pick.py                grasp pipeline
-    place.py               release pipeline
-    common.py              shared helpers (approach_target, AMCL re-seed, gripper-status wait, segmentation fallback chain)
+    pick.py                grasp pipeline (returns held_object_height_m)
+    place.py               release pipeline with three-mode dispatch (container | surface | floor)
+  utils/                   shared low-level helpers used by 2+ skills
+    __init__.py            arm reset, /odom stillness wait, SAM3 fallback prompts, seg-status parsing
   clients/                 external system adapters (the architecture's low-layer interface)
     __init__.py
     llm.py                 LiteLLM wrapper with Hermes-XML tool-call fallback
@@ -62,12 +70,24 @@ cp skill_based/.env.example skill_based/.env
 
 # Single-skill smoke tests (assume robot is pre-positioned for pick/place):
 python3 -m skill_based.main --test-pick "red coke can"
-python3 -m skill_based.main --test-place "trash bin" --object-name "red coke can"
+python3 -m skill_based.main --test-place "trash bin" --object-name "red coke can" --mode container --object-height-m 0.12
 python3 -m skill_based.main --test-approach "kitchen" --next-action pick --object-name "wooden coffee table"
 
 # Full planner loop:
 python3 -m skill_based.main --task "pick up the red coke can in the kitchen and place it on the wooden coffee table in the living room"
 ```
+
+### Place modes
+
+The `place` skill dispatches on a required `mode` argument:
+
+| Mode        | Trigger words                       | `target_location` semantics       |
+|-------------|-------------------------------------|-----------------------------------|
+| `container` | bin / trash / basket / box          | the container itself              |
+| `surface`   | table / shelf / rack / counter      | the elevated flat surface         |
+| `floor`     | "next to X on the floor" / "beside" | the **reference object** (not "floor") |
+
+The `pick` skill measures the held object's height from its SAM3 bounding box and returns it as `held_object_height_m`. The planner must forward that value into the subsequent `place` call (container mode ignores it; surface and floor need it for wrist-z math).
 
 `.env` is loaded automatically via `python-dotenv` from the package root. Run from the parent directory of `skill_based/` so the package import resolves.
 
