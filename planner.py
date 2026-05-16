@@ -125,27 +125,57 @@ PLANNER_TOOLS = [
         "function": {
             "name": "place",
             "description": (
-                "Release the held object onto the named target surface or container. "
+                "Release the held object at the named target per the selected mode. "
+                "Three modes:\n"
+                "  container: drop INTO a deep target (bin / basket).\n"
+                "  surface:   drop ON an elevated flat target (table / shelf / rack).\n"
+                "  floor:     drop NEXT TO a reference object on the floor "
+                "(target_location is the REFERENCE object, e.g. the other shoe).\n"
                 "Assumes the robot is already holding an object and positioned near "
-                "the target. Returns success when /gripper/status confirms release."
+                "the target. Returns success when /gripper/status confirms release "
+                "(and, for container mode, when the arm-cam verify sees the object "
+                "at the drop pose)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_location": {
                         "type": "string",
-                        "description": "Surface or container to place into (e.g. 'kitchen table', 'trash bin').",
+                        "description": (
+                            "Reference object to segment for the drop pose. "
+                            "container mode: the container (e.g. 'trash bin'). "
+                            "surface mode: the surface (e.g. 'wooden coffee table'). "
+                            "floor mode: a REFERENCE object on the floor "
+                            "(e.g. 'white shoe' — the held object is dropped next to it)."
+                        ),
                     },
                     "object_name": {
                         "type": "string",
                         "description": (
-                            "Name of the held object. Required: used for "
-                            "object-height lookup in surface mode and for the "
-                            "post-release visibility verify in container mode."
+                            "Name of the held object (the object IN the gripper). "
+                            "Required for the post-release arm-cam verify segmentation."
+                        ),
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["container", "surface", "floor"],
+                        "description": (
+                            "Placement mode. Choose from task context: 'container' "
+                            "for drops INTO a bin/basket; 'surface' for ON a table/shelf; "
+                            "'floor' for NEXT TO a reference object on the floor."
+                        ),
+                    },
+                    "object_height_m": {
+                        "type": "number",
+                        "description": (
+                            "Height of the held object in metres, from the PRIOR "
+                            "pick call's `held_object_height_m` result field. "
+                            "Required by surface and floor modes for wrist-z math. "
+                            "Container mode ignores it (pass 0.0 if unknown)."
                         ),
                     },
                 },
-                "required": ["target_location", "object_name"],
+                "required": ["target_location", "object_name", "mode", "object_height_m"],
             },
         },
     },
@@ -173,6 +203,8 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
             mcp=mcp,
             target_location=args["target_location"],
             object_name=args["object_name"],
+            mode=args["mode"],
+            object_height_m=float(args["object_height_m"]),
         )
     return {"success": False, "reason": f"unknown skill: {name}"}
 
@@ -208,7 +240,7 @@ async def run_planner(
     skill_tool_calls_total = 0
 
     for turn in range(max_turns):
-        logger.info(f"[planner] turn {turn + 1}/{max_turns}")
+        logger.info(f"=== PLANNER decision {turn + 1}/{max_turns} ===")
         response = call_llm(messages=messages, tools=PLANNER_TOOLS, model=model)
 
         messages.append(assistant_message(response))
@@ -226,7 +258,7 @@ async def run_planner(
             continue
 
         for tool_call_id, name, args in get_tool_calls(response):
-            logger.info(f"[planner] -> {name}({json.dumps(args)})")
+            logger.info(f"-> {name}({json.dumps(args)})")
             result = await _dispatch_skill(mcp, name, args)
             success = result.get("success")
             reason = result.get("reason", "")
@@ -236,10 +268,10 @@ async def run_planner(
             except (TypeError, ValueError):
                 pass
             if success:
-                logger.info(f"[planner] <- {name} : True ({calls} calls) {reason}")
+                logger.info(f"<- {name} : True ({calls} calls) {reason}")
             else:
                 logger.warning(
-                    f"[planner] <- {name} : False ({calls} calls) {reason}"
+                    f"<- {name} : False ({calls} calls) {reason}"
                 )
             messages.append(tool_result_message(tool_call_id, json.dumps(result)))
 

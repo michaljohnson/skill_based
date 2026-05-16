@@ -17,20 +17,214 @@ skill's signature and the structured success/failure result.
 """
 
 import asyncio
+import json
 import logging
+import math
 
 from skill_based.clients.mcp import MCPClient
-from skill_based.skills.common import (
-    STANDOFF_BY_NEXT_ACTION,
-    approach_target,
+from skill_based.utils import (
     geometric_fallback_prompts,
     move_arm_to_look_forward,
     parse_seg_status,
-    spin_search,
     wait_until_still,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# === Standoff distance by next_action ===
+#
+# The right standoff depends on what the manipulation step does once
+# the approach skill hands off:
+#   - pick: UR5 reaches forward at low z (~0.40m); 0.85m centroid
+#     distance leaves comfortable headroom for grasp pose math.
+#   - surface_place: wrist must be HIGH (surface_z + 0.31m for can on
+#     coffee table = 0.66m). UR5 top-down reach at z=0.66m caps near
+#     x=0.55m, so the approach skill must deliver closer (~0.45m).
+#   - container_place: drop INTO the bin from above; wrist sits 35cm
+#     above rim. Same UR5 high-z constraints apply but rim is usually
+#     at moderate height; 0.65m gives margin.
+#   - floor_place: similar to pick — soft set-down at low z.
+
+STANDOFF_BY_NEXT_ACTION = {
+    "pick": 0.85,
+    "surface_place": 0.45,
+    "container_place": 0.65,
+    "floor_place": 0.85,
+}
+
+
+# === Approach helpers (moved from common.py 2026-05-16) ===
+
+def _parse_robot_pose(raw) -> tuple[float | None, float | None, float | None]:
+    """Extract (x, y, yaw) from nav2__get_robot_pose response."""
+    if not isinstance(raw, str):
+        raw = str(raw)
+    try:
+        d = json.loads(raw)
+        body = d.get("result", d)
+        if isinstance(body, str):
+            body = json.loads(body)
+        pos = body["position"]
+        ori = body["orientation"]
+        return float(pos["x"]), float(pos["y"]), float(ori["yaw"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None, None, None
+
+
+async def approach_target(
+    mcp: MCPClient,
+    target_object: str,
+    standoff_m: float = 0.85,
+) -> dict:
+    """Drive to ``standoff_m`` from the segmented target.
+
+    Reads the cached segmentation centroid via perception MCP, then
+    dispatches to the shared ``nav2__approach_target`` primitive. The
+    primitive owns all geometry + motion (spin to face + drive_on_heading);
+    this wrapper only bridges perception (centroid lookup) to nav2.
+
+    All three architectures (LLM + tools, multi-agent, skill-based) share
+    this primitive to ensure they implement approach identically.
+
+    Returns ``{"success": bool, "reason": str, "tool_calls_used": int}``.
+    """
+    tool_calls = 0
+
+    # 1. Read cached centroid from perception
+    try:
+        grasp_raw = await mcp.call_tool_prefixed(
+            "perception__get_topdown_grasp_pose",
+            {"object_name": target_object},
+        )
+        tool_calls += 1
+        grasp = json.loads(grasp_raw) if isinstance(grasp_raw, str) else grasp_raw
+        target_x_base = float(grasp["centroid_base_frame"]["x"])
+        target_y_base = float(grasp["centroid_base_frame"]["y"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        return {
+            "success": False,
+            "reason": f"failed to read cached centroid: {e}",
+            "tool_calls_used": tool_calls,
+        }
+
+    target_dist = math.hypot(target_x_base, target_y_base)
+    logger.info(
+        f"target_base=({target_x_base:.2f},{target_y_base:.2f}) "
+        f"dist={target_dist:.2f}m standoff={standoff_m:.2f}m -> nav2__approach_target"
+    )
+
+    # 2. Delegate to the MCP primitive
+    try:
+        result_raw = await asyncio.wait_for(
+            mcp.call_tool_prefixed(
+                "nav2__approach_target",
+                {
+                    "target_x_base": target_x_base,
+                    "target_y_base": target_y_base,
+                    "standoff_m": standoff_m,
+                },
+            ),
+            timeout=60.0,
+        )
+        tool_calls += 1
+    except asyncio.TimeoutError:
+        return {
+            "success": False,
+            "reason": "nav2__approach_target wall-timeout after 60s",
+            "tool_calls_used": tool_calls,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "reason": f"nav2__approach_target error: {e}",
+            "tool_calls_used": tool_calls,
+        }
+
+    text = result_raw if isinstance(result_raw, str) else str(result_raw)
+    if "error" in text.lower():
+        return {
+            "success": False,
+            "reason": text,
+            "tool_calls_used": tool_calls,
+        }
+
+    # Settle: nav2 reports complete before robot fully decelerates AND
+    # before camera buffers flush from the new pose.
+    await asyncio.sleep(1.5)
+
+    return {
+        "success": True,
+        "reason": text,
+        "tool_calls_used": tool_calls,
+    }
+
+
+async def spin_search(
+    mcp: MCPClient,
+    target_object: str,
+    max_spins: int = 8,
+    spin_angle: float = 1.047,  # ~60 deg
+    camera: str = "front",
+) -> dict:
+    """Spin in place searching for ``target_object``.
+
+    Spins ``spin_angle`` radians at a time and calls SAM3 segmentation
+    on the requested camera after each spin, trying the literal target
+    plus geometric fallback prompts. Returns SUCCESS as soon as any
+    prompt anchors the target.
+    """
+    tool_calls = 0
+    prompts = geometric_fallback_prompts(target_object)
+    for i in range(max_spins):
+        try:
+            await mcp.call_tool_prefixed(
+                "nav2__spin_robot", {"angle": spin_angle}
+            )
+            tool_calls += 1
+            logger.info(
+                f"  [spin-search {i+1}/{max_spins}] spun {spin_angle:.2f}rad"
+            )
+        except Exception as e:
+            logger.error(f"  [spin-search] spin failed: {e}")
+            tool_calls += 1
+            continue
+
+        await wait_until_still(mcp)
+
+        anchored = False
+        for prompt in prompts:
+            try:
+                seg_raw = await mcp.call_tool_prefixed(
+                    "perception__segment_objects",
+                    {"prompt": prompt, "camera": camera, "timeout": 20},
+                )
+                tool_calls += 1
+                status = parse_seg_status(seg_raw)
+                logger.info(
+                    f"  [spin-search {i+1}/{max_spins}] SAM3 {camera} '{prompt}' -> {status}"
+                )
+            except Exception as e:
+                logger.error(f"  [spin-search] segmentation failed: {e}")
+                tool_calls += 1
+                continue
+            if status == "SUCCESS":
+                anchored = True
+                break
+        if anchored:
+            return {
+                "success": True,
+                "reason": (
+                    f"found '{target_object}' after {i+1} spin(s) via prompt '{prompt}'"
+                ),
+                "tool_calls_used": tool_calls,
+            }
+
+    return {
+        "success": False,
+        "reason": f"'{target_object}' not found after {max_spins} spins",
+        "tool_calls_used": tool_calls,
+    }
 
 
 # === Named-area entry poses ===
@@ -120,7 +314,7 @@ async def run(
     tool_calls += 1
     if not arm_reset.get("success"):
         logger.warning(
-            f"  [nav] arm reset failed: {arm_reset.get('reason')}; continuing"
+            f"arm reset failed: {arm_reset.get('reason')}; continuing"
         )
 
     # Step 2 — Drive to entry pose.
@@ -143,18 +337,18 @@ async def run(
         # via the approach step instead of bailing. The wall-timeout is
         # not authoritative for arrival outcome.
         logger.warning(
-            f"  [nav] navigate_to_pose wall-timeout after {NAV_WALL_TIMEOUT:.0f}s; "
+            f"navigate_to_pose wall-timeout after {NAV_WALL_TIMEOUT:.0f}s; "
             f"checking outcome via approach"
         )
         tool_calls += 1
     except Exception as e:
         # One retry after clear_costmaps for transient failures
-        logger.warning(f"  [nav] first navigate_to_pose error: {e}; clear_costmaps + retry")
+        logger.warning(f"first navigate_to_pose error: {e}; clear_costmaps + retry")
         try:
             await mcp.call_tool_prefixed("nav2__clear_costmaps", {})
             tool_calls += 1
         except Exception as e2:
-            logger.warning(f"  [nav] clear_costmaps error: {e2}")
+            logger.warning(f"clear_costmaps error: {e2}")
         try:
             await asyncio.wait_for(
                 mcp.call_tool_prefixed(
@@ -187,10 +381,10 @@ async def run(
             )
             tool_calls += 1
             status = parse_seg_status(seg_raw)
-            logger.info(f"  [nav] front-cam SAM3 '{prompt}' -> {status}")
+            logger.info(f"front-cam SAM3 '{prompt}' -> {status}")
         except Exception as e:
             status = "ERROR"
-            logger.error(f"  [nav] front-cam SAM3 error: {e}")
+            logger.error(f"front-cam SAM3 error: {e}")
             tool_calls += 1
         if status == "SUCCESS":
             break
