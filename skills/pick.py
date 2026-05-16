@@ -16,6 +16,7 @@ navigator re-positions.
 import asyncio
 import json
 import logging
+import re
 
 from skill_based.clients.mcp import MCPClient
 from skill_based.skills.common import (
@@ -38,6 +39,16 @@ UR5_REACH_X = 1.10
 # consumed). Real picks use the orientation from get_topdown_grasp_pose,
 # which is shape-aware (PCA on the segmented point cloud).
 TOPDOWN_ORIENTATION_DEFAULT = [1.0, 0.0, 0.0, 0.0]
+
+# Vertical clearance for pre-grasp and post-grasp lift, in metres.
+# 2026-05-16: lowered from 0.20 to 0.12 because at top-down orientation
+# the UR5e kinematic envelope above z≈0.40 only extends to ~0.78 m
+# radial. Targets at the practical reach edge (radial ≳ 0.80 m) are
+# unreachable in the natural IK branch at z+0.20 — the solver returns
+# wrap-around / wrist-flip branches that plan_and_execute cannot
+# traverse from the current state. 0.12 keeps the pre-grasp inside the
+# natural-branch envelope while still giving a clean visual descent.
+PRE_GRASP_CLEARANCE_M = 0.12
 
 
 def _orientation_to_list(orientation: dict | list) -> list[float]:
@@ -69,7 +80,7 @@ async def _gripper_status(mcp: MCPClient, timeout: float = 3.0) -> str:
         msg = data.get("msg", data)
         return msg.get("data", "") if isinstance(msg, dict) else str(msg)
     except Exception as e:
-        logger.warning(f"  [pick] gripper status read error: {e}")
+        logger.warning(f"gripper status read error: {e}")
         return ""
 
 
@@ -86,7 +97,7 @@ async def _segment_object(
         )
         return parse_seg_status(raw), 1
     except Exception as e:
-        logger.warning(f"  [pick] segment_objects({camera}) error: {e}")
+        logger.warning(f"segment_objects({camera}) error: {e}")
         return "ERROR", 1
 
 
@@ -101,11 +112,11 @@ async def _grasp_pose(
         )
         data = json.loads(raw) if isinstance(raw, str) else raw
         if "centroid_base_frame" not in data:
-            logger.warning(f"  [pick] grasp pose missing centroid: {data}")
+            logger.warning(f"grasp pose missing centroid: {data}")
             return None, 1
         return data, 1
     except Exception as e:
-        logger.warning(f"  [pick] get_topdown_grasp_pose error: {e}")
+        logger.warning(f"get_topdown_grasp_pose error: {e}")
         return None, 1
 
 
@@ -133,6 +144,36 @@ async def _close_gripper(mcp: MCPClient) -> int:
     return 1
 
 
+_ARM_JOINT_ORDER = [
+    "arm_shoulder_pan_joint",
+    "arm_shoulder_lift_joint",
+    "arm_elbow_joint",
+    "arm_wrist_1_joint",
+    "arm_wrist_2_joint",
+    "arm_wrist_3_joint",
+]
+_IK_LINE_RE = re.compile(r"^\s*([\w_]+):\s*([-+]?\d*\.?\d+)\s*rad", re.MULTILINE)
+
+
+def _parse_ik_joints(ik_raw: str) -> list[float] | None:
+    """Parse joint values from the compute_ik MCP response.
+
+    Expected format:
+        Inverse kinematics solution for 'arm':
+          arm_shoulder_pan_joint: 0.12 rad
+          arm_shoulder_lift_joint: -1.45 rad
+          ...
+    Returns the joints in canonical UR5 order, or None if the response
+    is missing or malformed.
+    """
+    if not ik_raw or "kinematics solution" not in ik_raw.lower():
+        return None
+    by_name = {name: float(val) for name, val in _IK_LINE_RE.findall(ik_raw)}
+    if not all(j in by_name for j in _ARM_JOINT_ORDER):
+        return None
+    return [by_name[j] for j in _ARM_JOINT_ORDER]
+
+
 async def _plan_to_xyz(
     mcp: MCPClient,
     x: float,
@@ -142,48 +183,99 @@ async def _plan_to_xyz(
     *,
     clear_scene_on_retry: bool = True,
 ) -> tuple[bool, str, int]:
-    """Plan + execute a top-down pose, with one clear_planning_scene retry.
+    """Plan + execute a top-down pose via the IK→joint_state pattern.
+
+    Per feedback_plan_pose_unreliable and the 2026-05-15 finding,
+    plan_and_execute(target_type="pose") is unreliable for low-z grasp
+    targets: OMPL's Cartesian goal sampler returns GOAL_STATE_INVALID
+    even when compute_ik finds a valid joint solution. Routing through
+    compute_ik → plan_and_execute(target_type="joint_state") bypasses
+    the broken sampler and plans in joint space directly.
 
     ``orientation`` is the quaternion as ``[x, y, z, w]``. When omitted,
-    the default top-down orientation (180 deg about X) is used; real
-    picks should pass the shape-aware orientation returned by
-    ``perception__get_topdown_grasp_pose``.
+    the default top-down orientation is used; real picks should pass
+    the shape-aware orientation from ``perception__get_topdown_grasp_pose``.
     """
     if orientation is None:
         orientation = TOPDOWN_ORIENTATION_DEFAULT
-    target = {
-        "position": [x, y, z],
-        "orientation": orientation,
-        "frame_id": "base_footprint",
-    }
+
+    # Step A — compute IK
     try:
-        result = await mcp.call_tool_prefixed(
-            "moveit__plan_and_execute",
-            {"group": "arm", "target_type": "pose", "target": target},
+        ik_raw = await mcp.call_tool_prefixed(
+            "moveit__compute_ik",
+            {"group": "arm", "position": [x, y, z], "orientation": orientation},
         )
-        if "fail" not in result.lower() or "completed" in result.lower():
-            return True, result[:200], 1
     except Exception as e:
-        return False, f"plan_and_execute error: {e}", 1
+        return False, f"compute_ik error at ({x:.2f},{y:.2f},{z:.2f}): {e}", 1
+    joints = _parse_ik_joints(ik_raw)
+    if joints is None:
+        return (
+            False,
+            f"compute_ik returned no valid IK at ({x:.2f},{y:.2f},{z:.2f}): "
+            f"{ik_raw[:120] if isinstance(ik_raw, str) else ik_raw!r}",
+            1,
+        )
 
-    if not clear_scene_on_retry:
-        return False, f"plan failed at ({x:.2f},{y:.2f},{z:.2f}): {result[:200]}", 1
-
-    # Retry once after clearing the planning scene
+    # Step B — clear stale collision objects BEFORE planning. perception
+    # MCP's get_topdown_grasp_pose (and similar tools) republish the
+    # target object as a collision object after each segmentation; if we
+    # don't clear right before the plan, the descent finds the object
+    # back in the scene and the goal state is rejected as in-collision
+    # with the gripper finger. The step-2b clear at the start of the
+    # pick is not enough — segmentation happens AFTER step 2b.
     try:
         await mcp.call_tool_prefixed("moveit__clear_planning_scene", {})
     except Exception as e:
-        logger.warning(f"  [pick] clear_planning_scene error: {e}")
+        logger.warning(f"clear_planning_scene pre-plan error: {e}")
+
+    # Step C — plan + execute to joint_state
     try:
         result = await mcp.call_tool_prefixed(
             "moveit__plan_and_execute",
-            {"group": "arm", "target_type": "pose", "target": target},
+            {
+                "group": "arm",
+                "target_type": "joint_state",
+                "target": {"joint_positions": joints},
+            },
         )
         if "fail" not in result.lower() or "completed" in result.lower():
-            return True, f"retry ok: {result[:200]}", 3
-        return False, f"retry still failed: {result[:200]}", 3
+            return True, result[:200], 3
     except Exception as e:
-        return False, f"retry error: {e}", 3
+        return False, f"plan_and_execute(joint_state) error: {e}", 3
+
+    if not clear_scene_on_retry:
+        return False, f"plan failed at ({x:.2f},{y:.2f},{z:.2f}): {result[:200]}", 3
+
+    # Retry: re-clear and re-IK (the planning scene may have been
+    # repopulated mid-plan by another publisher)
+    try:
+        await mcp.call_tool_prefixed("moveit__clear_planning_scene", {})
+    except Exception as e:
+        logger.warning(f"clear_planning_scene retry error: {e}")
+    try:
+        ik_raw = await mcp.call_tool_prefixed(
+            "moveit__compute_ik",
+            {"group": "arm", "position": [x, y, z], "orientation": orientation},
+        )
+    except Exception as e:
+        return False, f"retry compute_ik error: {e}", 5
+    joints = _parse_ik_joints(ik_raw)
+    if joints is None:
+        return False, "retry compute_ik returned no valid IK", 5
+    try:
+        result = await mcp.call_tool_prefixed(
+            "moveit__plan_and_execute",
+            {
+                "group": "arm",
+                "target_type": "joint_state",
+                "target": {"joint_positions": joints},
+            },
+        )
+        if "fail" not in result.lower() or "completed" in result.lower():
+            return True, f"retry ok: {result[:200]}", 6
+        return False, f"retry still failed: {result[:200]}", 6
+    except Exception as e:
+        return False, f"retry error: {e}", 6
 
 
 async def run(mcp: MCPClient, object_name: str) -> dict:
@@ -233,7 +325,9 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
             "tool_calls_used": tool_calls,
         }
 
-    # Step 2 — clear octomap
+    # Step 2 — clear octomap (mostly defensive; sensors:[] disables the
+    # in-process octomap_updater, but keep this in case sensors are
+    # re-enabled later)
     try:
         await mcp.call_tool_prefixed(
             "ros__call_service",
@@ -245,17 +339,29 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
         )
         tool_calls += 1
     except Exception as e:
-        logger.warning(f"  [pick] clear_octomap error: {e}")
+        logger.warning(f"clear_octomap error: {e}")
+        tool_calls += 1
+
+    # Step 2b — clear stale collision objects from prior runs. Open3D
+    # drop-pose (and similar perception code) can publish collision
+    # objects to /collision_object that persist across pick attempts and
+    # block the descent when the gripper finger would clip them. See
+    # feedback_clean_planning_scene_between_picks.
+    try:
+        await mcp.call_tool_prefixed("moveit__clear_planning_scene", {})
+        tool_calls += 1
+    except Exception as e:
+        logger.warning(f"clear_planning_scene error: {e}")
         tool_calls += 1
 
     # Step 3 — segment on arm camera; front-cam fallback if missed
     status, calls = await _segment_object(mcp, object_name, camera="arm")
     tool_calls += calls
-    logger.info(f"  [pick] arm SAM3 -> {status}")
+    logger.info(f"arm SAM3 -> {status}")
     if status != "SUCCESS":
         status, calls = await _segment_object(mcp, object_name, camera="front")
         tool_calls += calls
-        logger.info(f"  [pick] front SAM3 fallback -> {status}")
+        logger.info(f"front SAM3 fallback -> {status}")
         if status != "SUCCESS":
             return {
                 **base_result,
@@ -298,7 +404,7 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     aspect = float(grasp.get("principal_axis_aspect_ratio", 1.0))
     oriented = bool(grasp.get("oriented", False))
     logger.info(
-        f"  [pick] grasp x={gx:.3f} y={gy:.3f} z={gz:.3f} "
+        f"grasp x={gx:.3f} y={gy:.3f} z={gz:.3f} "
         f"centroid_z={centroid_z:.3f} "
         f"yaw_deg={grasp_yaw_deg:.1f} aspect={aspect:.2f} "
         f"oriented={oriented}"
@@ -327,11 +433,11 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
             "tool_calls_used": tool_calls,
         }
 
-    # Step 7 — pre-grasp pose (20cm above grasp z). Higher clearance
-    # gives a cleaner visual descent and matches the lift height for
-    # a symmetric approach / retreat silhouette.
+    # Step 7 — pre-grasp pose (PRE_GRASP_CLEARANCE_M above grasp z).
+    # Clearance is chosen to stay inside the UR5e natural-IK envelope at
+    # the practical reach edge; see PRE_GRASP_CLEARANCE_M definition.
     ok, info, calls = await _plan_to_xyz(
-        mcp, gx, gy, gz + 0.20, orientation=grasp_orientation
+        mcp, gx, gy, gz + PRE_GRASP_CLEARANCE_M, orientation=grasp_orientation
     )
     tool_calls += calls
     if not ok:
@@ -356,7 +462,7 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
             _tokenize(object_name) & _tokenize(status[len("attached:"):])
         ):
             logger.info(
-                f"  [pick] descent reported failure but {status} — proceeding"
+                f"descent reported failure but {status} — proceeding"
             )
         else:
             return {
@@ -390,11 +496,11 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
             "tool_calls_used": tool_calls,
         }
     attached_model = attach.get("model")
-    logger.info(f"  [pick] attached:{attached_model}")
+    logger.info(f"attached:{attached_model}")
 
-    # Step 11 — lift 20cm above grasp
+    # Step 11 — lift PRE_GRASP_CLEARANCE_M above grasp (symmetric with pre-grasp)
     ok, info, calls = await _plan_to_xyz(
-        mcp, gx, gy, gz + 0.20, orientation=grasp_orientation
+        mcp, gx, gy, gz + PRE_GRASP_CLEARANCE_M, orientation=grasp_orientation
     )
     tool_calls += calls
     if not ok:
@@ -402,7 +508,7 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
         # Try a more conservative single retry; if it fails, report
         # SUCCESS with a warning so the planner knows the lift was partial.
         logger.warning(
-            f"  [pick] lift plan failed but object is attached: {info}. "
+            f"lift plan failed but object is attached: {info}. "
             "Returning SUCCESS with caveat."
         )
 
@@ -414,27 +520,27 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
         # look_forward without an intermediate lift; try once via
         # moveit named_state directly.
         logger.warning(
-            f"  [pick] post-lift look_forward failed: {arm.get('reason')}; "
+            f"post-lift look_forward failed: {arm.get('reason')}; "
             "attempting intermediate lift first"
         )
         try:
-            await mcp.call_tool_prefixed(
-                "moveit__plan_and_execute",
-                {
-                    "group": "arm",
-                    "target_type": "pose",
-                    "target": {
-                        "position": [gx, gy, max(gz + 0.40, 0.90)],
-                        "orientation": grasp_orientation,
-                        "frame_id": "base_footprint",
-                    },
-                },
+            # Intermediate lift kept conservative to stay inside the
+            # natural-IK envelope; 0.65m is roughly waist-height transit.
+            ok, info, calls = await _plan_to_xyz(
+                mcp,
+                gx,
+                gy,
+                max(gz + 0.25, 0.65),
+                orientation=grasp_orientation,
+                clear_scene_on_retry=False,
             )
-            tool_calls += 1
+            tool_calls += calls
+            if not ok:
+                logger.warning(f"intermediate lift failed: {info}")
             await move_arm_to_look_forward(mcp)
             tool_calls += 1
         except Exception as e:
-            logger.warning(f"  [pick] intermediate lift error: {e}")
+            logger.warning(f"intermediate lift error: {e}")
 
     return {
         **base_result,
