@@ -8,6 +8,14 @@ Originally built as one of three architectures compared in a BA thesis on "where
 
 The headline claim: ~60 MCP tools across 4 servers are never exposed to the planner LLM. The planner sees exactly 3 skill schemas. All low-level decisions (which MCP tool, in what order, with what arguments, with what error handling) are absorbed by deterministic Python.
 
+## Short Demo
+
+
+
+https://github.com/user-attachments/assets/59f5b0d4-e723-47ab-bc2b-48469d949937
+
+
+
 ## Comparison-axis position (vs. siblings)
 
 | Architecture | Where the policy lives | Planner LLM |
