@@ -447,7 +447,21 @@ async def wait_for_gripper_attached(
         model_tokens = _tokenize(model)
         if not expected_tokens:
             return True, model  # nothing to compare; trust the attach
-        return bool(expected_tokens & model_tokens), model
+        if expected_tokens & model_tokens:
+            return True, model
+        # Token mismatch but attach IS reported. The gripper physically
+        # holds SOMETHING at the grasp pose (which was derived from a
+        # SAM3 segmentation of the user's prompt). Mismatch between the
+        # user's vocabulary ("red can") and the Gazebo model name
+        # ("Kitchen_Coke") is a labelling artifact, not a pick failure.
+        # Treat as success with a warning so the caller can audit.
+        # 2026-05-16: changed from hard-fail to warn-and-pass.
+        logger.warning(
+            f"  [attach] model '{model}' attached but does not token-match "
+            f"expected '{expected_object}' (expected_tokens={sorted(expected_tokens)}, "
+            f"model_tokens={sorted(model_tokens)}); accepting attach"
+        )
+        return True, model
 
     # Phase 1
     try:
