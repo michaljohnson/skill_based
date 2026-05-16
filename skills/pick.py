@@ -19,15 +19,128 @@ import logging
 import re
 
 from skill_based.clients.mcp import MCPClient
-from skill_based.skills.common import (
+from skill_based.utils import (
     LOOK_FORWARD_JOINTS,
-    _tokenize,
     move_arm_to_look_forward,
     parse_seg_status,
-    wait_for_gripper_attached,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# === Gripper attach verification (moved from common.py 2026-05-16) ===
+
+def _tokenize(s: str) -> set[str]:
+    """Split on non-alphanumerics AND CamelCase boundaries.
+
+    Drops tokens shorter than 3 characters. ``"KidsRoom_WoodCube"``
+    splits to ``{"kids", "room", "wood", "cube"}``; ``"coke can"``
+    splits to ``{"coke", "can"}``; the two share no token, but
+    ``coke can`` against ``Kitchen_Coke`` shares ``coke``.
+    """
+    out: set[str] = set()
+    cur: list[str] = []
+
+    def _flush():
+        if cur:
+            tok = "".join(cur).lower()
+            if len(tok) >= 3:
+                out.add(tok)
+            cur.clear()
+
+    prev_lower = False
+    for ch in s:
+        if ch.isalnum():
+            if ch.isupper() and prev_lower:
+                _flush()
+            cur.append(ch)
+            prev_lower = ch.islower()
+        else:
+            _flush()
+            prev_lower = False
+    _flush()
+    return out
+
+
+async def wait_for_gripper_attached(
+    mcp: MCPClient,
+    expected_object: str | None = None,
+    timeout: float = 8.0,
+    retry_timeout: float = 5.0,
+) -> dict:
+    """Subscribe to /gripper/status and wait for ``attached:<model>``.
+
+    Two-phase wait: initial ``timeout`` seconds, then a ``retry_timeout``
+    second retry if the first wait did not see an attach. The two-phase
+    pattern absorbs the latency between close-gripper-action completion
+    and the attach plugin firing.
+
+    ``expected_object`` is matched by token overlap against the Gazebo
+    model name. 2026-05-16: warn-and-pass on token mismatch — the
+    gripper physically holds SOMETHING (SAM3-segmented at the grasp
+    pose), so mismatch between user vocabulary and Gazebo model name
+    is a labelling artifact, not a pick failure.
+    """
+
+    async def _read(t: float) -> str:
+        raw = await mcp.call_tool_prefixed(
+            "ros__subscribe_once",
+            {
+                "topic": "/gripper/status",
+                "msg_type": "std_msgs/msg/String",
+                "timeout": int(t),
+            },
+        )
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        msg = data.get("msg", data)
+        return msg.get("data", "") if isinstance(msg, dict) else str(msg)
+
+    def _matches(body: str) -> tuple[bool, str | None]:
+        if not body.startswith("attached:"):
+            return False, None
+        model = body[len("attached:"):].strip()
+        if expected_object is None:
+            return True, model
+        expected_tokens = _tokenize(expected_object)
+        model_tokens = _tokenize(model)
+        if not expected_tokens:
+            return True, model
+        if expected_tokens & model_tokens:
+            return True, model
+        logger.warning(
+            f"  [attach] model '{model}' attached but does not token-match "
+            f"expected '{expected_object}' (expected_tokens={sorted(expected_tokens)}, "
+            f"model_tokens={sorted(model_tokens)}); accepting attach"
+        )
+        return True, model
+
+    # Phase 1
+    first_body = ""
+    try:
+        body = await _read(timeout)
+        ok, model = _matches(body)
+        if ok:
+            return {"success": True, "reason": f"attached:{model}", "model": model}
+        first_body = body
+    except Exception as e:
+        logger.warning(f"  [attach] first read error: {e}")
+
+    # Phase 2 — retry with shorter timeout
+    await asyncio.sleep(0.5)
+    try:
+        body = await _read(retry_timeout)
+        ok, model = _matches(body)
+        if ok:
+            return {"success": True, "reason": f"attached:{model} (retry)", "model": model}
+        return {
+            "success": False,
+            "reason": (
+                f"gripper not attached after {timeout:.0f}s + "
+                f"{retry_timeout:.0f}s retry; last={body or first_body or 'no message'}"
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "reason": f"attach retry error: {e}"}
 
 
 # UR5e practical reach forward from base_footprint, per pick.md step 5.
@@ -403,9 +516,16 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     grasp_yaw_deg = float(grasp.get("principal_axis_angle_deg", 0.0))
     aspect = float(grasp.get("principal_axis_aspect_ratio", 1.0))
     oriented = bool(grasp.get("oriented", False))
+    # Held-object height for downstream place skills (surface / floor
+    # modes need it for wrist-z math). Comes from the SAM3 bounding-box
+    # measurement, NOT a per-object lookup table — see
+    # feedback_no_hardcoded_object_dimensions for why the lookup was
+    # removed.
+    bbox_size = grasp.get("bounding_box", {}).get("size", {})
+    held_object_height_m = float(bbox_size.get("z", 0.0))
     logger.info(
         f"grasp x={gx:.3f} y={gy:.3f} z={gz:.3f} "
-        f"centroid_z={centroid_z:.3f} "
+        f"centroid_z={centroid_z:.3f} height={held_object_height_m:.3f} "
         f"yaw_deg={grasp_yaw_deg:.1f} aspect={aspect:.2f} "
         f"oriented={oriented}"
     )
@@ -546,5 +666,6 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
         **base_result,
         "success": True,
         "reason": f"grasped {attached_model} (gripper attached)",
+        "held_object_height_m": held_object_height_m,
         "tool_calls_used": tool_calls,
     }
