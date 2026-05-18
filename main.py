@@ -190,6 +190,37 @@ def main() -> None:
             datefmt="%H:%M:%S",
         )
     else:
+        # ANSI colour codes are only emitted to a real terminal
+        # (sys.stderr.isatty()); piping the output to a file or via tee
+        # keeps the captured log plain.
+        import re
+        import sys
+
+        _USE_COLOR = sys.stderr.isatty()
+        _RED    = "\033[31m" if _USE_COLOR else ""
+        _GREEN  = "\033[32m" if _USE_COLOR else ""
+        _YELLOW = "\033[33m" if _USE_COLOR else ""
+        _BOLD   = "\033[1m"  if _USE_COLOR else ""
+        _RESET  = "\033[0m"  if _USE_COLOR else ""
+
+        _RE_SUCCESS_TRUE  = re.compile(r'("success"\s*:\s*true|success\s*=\s*[Tt]rue|success=True)')
+        _RE_SUCCESS_FALSE = re.compile(r'("success"\s*:\s*false|success\s*=\s*[Ff]alse|success=False)')
+        _RE_ERR_NONE      = re.compile(r'("error_code"\s*:\s*"NONE"|error_code=NONE)')
+        _RE_ERR_OTHER     = re.compile(r'("error_code"\s*:\s*"(?!NONE")[A-Z_]+"|error_code=(?!NONE\b)[A-Z_]+)')
+        _RE_KW_SUCCESS    = re.compile(r'\bSUCCESS\b')
+        _RE_KW_FAILED     = re.compile(r'\b(FAILED|FAILURE|FAIL)\b')
+
+        def _colorize(msg: str) -> str:
+            if not _USE_COLOR:
+                return msg
+            msg = _RE_SUCCESS_TRUE.sub(lambda m: _GREEN + m.group(0) + _RESET, msg)
+            msg = _RE_SUCCESS_FALSE.sub(lambda m: _RED + m.group(0) + _RESET, msg)
+            msg = _RE_ERR_NONE.sub(lambda m: _GREEN + m.group(0) + _RESET, msg)
+            msg = _RE_ERR_OTHER.sub(lambda m: _RED + m.group(0) + _RESET, msg)
+            msg = _RE_KW_SUCCESS.sub(_GREEN + "SUCCESS" + _RESET, msg)
+            msg = _RE_KW_FAILED.sub(lambda m: _RED + m.group(0) + _RESET, msg)
+            return msg
+
         class _SkillTagFormatter(logging.Formatter):
             # Uppercase [PLANNER] signals the LLM-reasoning agent;
             # lowercase skill tags signal deterministic Python execution
@@ -205,15 +236,16 @@ def main() -> None:
 
             def format(self, record: logging.LogRecord) -> str:
                 msg = record.getMessage()
-                # Section-break lines (e.g. "=== PLANNER decision 1/30 ===")
-                # are printed without a tag prefix so they stand out as
-                # visual boundaries between planner reasoning and skill
-                # execution.
+                # Section-break lines are printed without a tag prefix so
+                # they stand out as visual boundaries between planner
+                # reasoning and skill execution. Bold on terminal.
                 if msg.startswith("==="):
-                    return msg
+                    return f"{_BOLD}{msg}{_RESET}"
                 tag = self._TAGS.get(record.name, f"[{record.name}]")
+                msg = _colorize(msg)
                 if record.levelno >= logging.WARNING:
-                    return f"{tag} {record.levelname}: {msg}"
+                    level_color = _RED if record.levelno >= logging.ERROR else _YELLOW
+                    return f"{tag} {level_color}{record.levelname}{_RESET}: {msg}"
                 return f"{tag} {msg}"
 
         handler = logging.StreamHandler()
