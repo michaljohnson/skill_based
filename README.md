@@ -17,6 +17,7 @@ https://github.com/user-attachments/assets/59f5b0d4-e723-47ab-bc2b-48469d949937
 
 
 ## Comparison-axis position (vs. siblings)
+![Overview architecture](docs/overview.png)
 
 | Architecture | Where the policy lives | Planner LLM |
 |---|---|---|
