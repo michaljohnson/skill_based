@@ -22,7 +22,7 @@ https://github.com/user-attachments/assets/59f5b0d4-e723-47ab-bc2b-48469d949937
 | Architecture | Where the policy lives | Planner LLM |
 |---|---|---|
 | Single-agent | LLM context, raw MCP tool surface | Frontier (e.g. Claude Opus) |
-| Multi-agent | Orchestrator + 3 LLM sub-agents, narrow MCP subsets per agent | Frontier (e.g. Claude Opus) |
+| [Multi-agent](https://github.com/michaljohnson/multi_agent) | Orchestrator + 3 LLM sub-agents, narrow MCP subsets per agent | Frontier (e.g. Claude Opus) |
 | **Skill-based** | **Inside Python skills, hidden from the LLM** | **Small open-weights or frontier — both supported** |
 
 The smaller-model + smarter-skills pairing is this architecture's design point, not a confound. Any LiteLLM-supported model works; see `.env.example`.
@@ -39,10 +39,10 @@ Both completed the task successfully. The planner emits one tool call per turn o
 - Python 3.10+
 - `litellm`, `python-dotenv`, an `mcp` Python client (any FastMCP-style streamable-http client works)
 - One or more MCP servers exposing the tool families this code expects:
-  - **nav2** — drive, navigate-to-pose, spin, lifecycle, `approach_target`
-  - **moveit** — plan/execute, IK, planning scene
-  - **perception** — segmentation, top-down grasp/place pose, look
-  - **ros** — generic topics, services, actions, parameters
+  - [**nav2**](https://github.com/michaljohnson/nav2_mcp_server) — drive, navigate-to-pose, spin, lifecycle, `approach_target`
+  - [**moveit**](https://github.com/michaljohnson/moveit-mcp-server) — plan/execute, IK, planning scene
+  - [**perception**](https://github.com/michaljohnson/perception_mcp_server) — segmentation, top-down grasp/place pose, look
+  - [**ros**](https://github.com/robotmcp/ros-mcp-server) — generic topics, services, actions, parameters
 - An LLM provider (Anthropic API, OpenAI-compatible vLLM, OpenAI, Ollama — anything LiteLLM supports)
 
 The MCP servers are not part of this package; you bring your own. The architecture's contract with them is "any tool-calling LLM should be able to use them," which is exactly what an MCP server provides.
