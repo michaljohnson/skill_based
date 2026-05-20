@@ -1,6 +1,6 @@
 # Skill-based architecture
 
-A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks. Inspired by the CaP-X programmatic skill-abstraction pattern (Fu et al., 2026), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
+A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks on a [Summit XL](https://github.com/icclab/icclab_summit_xl) mobile manipulator (UR5 + Robotiq 2F-140) using ROS 2 Jazzy. Inspired by the CaP-X programmatic skill-abstraction pattern (Fu et al., 2026), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
 
 Originally built as one of three architectures compared in a BA thesis on "where the policy should live" in agentic robotics; released so others can reuse the pattern.
 
@@ -16,12 +16,12 @@ https://github.com/user-attachments/assets/59f5b0d4-e723-47ab-bc2b-48469d949937
 
 
 
-## Comparison-axis position (vs. siblings)
+## Comparison-axis position
 ![Overview architecture](docs/overview.png)
 
 | Architecture | Where the policy lives | Planner LLM |
 |---|---|---|
-| Single-agent | LLM context, raw MCP tool surface | Frontier (e.g. Claude Opus) |
+| [Single-agent](https://github.com/anthropics/claude-code) | LLM context, raw MCP tool surface | Frontier (e.g. Claude Opus) |
 | [Multi-agent](https://github.com/michaljohnson/multi_agent) | Orchestrator + 3 LLM sub-agents, narrow MCP subsets per agent | Frontier (e.g. Claude Opus) |
 | **Skill-based** | **Inside Python skills, hidden from the LLM** | **Small open-weights or frontier — both supported** |
 
@@ -66,7 +66,6 @@ skill_based/
     llm.py                 LiteLLM wrapper with Hermes-XML tool-call fallback
     mcp.py                 MCP connection manager
   docs/
-    architecture.png       3-level diagram (high/middle/low)
   .env.example             environment-variable template
   README.md                this file
 ```
@@ -80,10 +79,10 @@ cp skill_based/.env.example skill_based/.env
 # Single-skill smoke tests (assume robot is pre-positioned for pick/place):
 python3 -m skill_based.main --test-pick "red coke can"
 python3 -m skill_based.main --test-place "trash bin" --object-name "red coke can" --mode container --object-height-m 0.12
-python3 -m skill_based.main --test-approach "kitchen" --next-action pick --object-name "wooden coffee table"
+python3 -m skill_based.main --test-approach "living room" --next-action pick --object-name "wooden coffee table"
 
 # Full planner loop:
-python3 -m skill_based.main --task "pick up the red coke can in the kitchen and place it on the wooden coffee table in the living room"
+python3 -m skill_based.main --task "pick up the red coke can in the kitchen and place it on the wooden surface in the living room"
 ```
 
 ### Place modes
