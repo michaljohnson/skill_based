@@ -8,22 +8,22 @@
 
 A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks on a [Summit XL](https://github.com/icclab/icclab_summit_xl) mobile manipulator (UR5 + Robotiq 2F-140) using ROS 2 Jazzy. Inspired by the CaP-X programmatic skill-abstraction pattern (Fu et al., 2026), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
 
-Originally built as one of three architectures compared in a BA thesis on "where the policy should live" in agentic robotics; released so others can reuse the pattern.
+
 
 ![Architecture diagram](docs/architecture.png)
 
-The headline claim: ~60 MCP tools across 4 servers are never exposed to the planner LLM. The planner sees exactly 3 skill schemas. All low-level decisions (which MCP tool, in what order, with what arguments, with what error handling) are absorbed by deterministic Python.
 
 ## Short Demo
 
-
-
 https://github.com/user-attachments/assets/59f5b0d4-e723-47ab-bc2b-48469d949937
+
+Originally built as one of three architectures compared in a BA thesis on "where the policy should live" in agentic robotics; released so others can reuse the pattern.
+
+The headline claim: ~60 MCP tools across 4 servers are never exposed to the planner LLM. The planner sees exactly 3 skill schemas. All low-level decisions (which MCP tool, in what order, with what arguments, with what error handling) are absorbed by deterministic Python.
 
 
 
 ## Comparison-axis position
-![Overview architecture](docs/overview.png)
 
 | Architecture | Where the policy lives | Planner LLM |
 |---|---|---|
