@@ -1,9 +1,14 @@
 # Skill-based architecture
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![ROS 2](https://img.shields.io/badge/ROS%202-Jazzy-22314e)
-![LiteLLM](https://img.shields.io/badge/LiteLLM-provider--agnostic-7e3fa8)
-![MCP](https://img.shields.io/badge/MCP-client-orange)
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![ROS 2](https://img.shields.io/badge/ROS%202-Jazzy-22314e?logo=ros)
+![LiteLLM](https://img.shields.io/badge/LiteLLM-Provider--Agnostic-7e3fa8)
+![FastMCP](https://img.shields.io/badge/FastMCP-MCP%20Framework-orange)
+![Nav2](https://img.shields.io/badge/Nav2-Navigation-brightgreen?logo=ros)
+![MoveIt](https://img.shields.io/badge/MoveIt-Motion%20Planning-0a7e8c)
+![SAM 3](https://img.shields.io/badge/SAM--3-Segmentation-red)
+![GroundingDINO](https://img.shields.io/badge/GroundingDINO-Detection-9d2c2c)
+![CaP-X](https://img.shields.io/badge/inspired%20by-CaP--X-purple)
 ![Last commit](https://img.shields.io/github/last-commit/michaljohnson/skill_based)
 
 A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks on a [Summit XL](https://github.com/icclab/icclab_summit_xl) mobile manipulator (UR5 + Robotiq 2F-140) using ROS 2 Jazzy. Inspired by the CaP-X programmatic skill-abstraction pattern ([Fu et al., 2026](https://arxiv.org/abs/2603.22435)), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
