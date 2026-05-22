@@ -6,7 +6,7 @@
 ![MCP](https://img.shields.io/badge/MCP-client-orange)
 ![Last commit](https://img.shields.io/github/last-commit/michaljohnson/skill_based)
 
-A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks on a [Summit XL](https://github.com/icclab/icclab_summit_xl) mobile manipulator (UR5 + Robotiq 2F-140) using ROS 2 Jazzy. Inspired by the CaP-X programmatic skill-abstraction pattern (Fu et al., 2026), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
+A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks on a [Summit XL](https://github.com/icclab/icclab_summit_xl) mobile manipulator (UR5 + Robotiq 2F-140) using ROS 2 Jazzy. Inspired by the CaP-X programmatic skill-abstraction pattern ([Fu et al., 2026](https://arxiv.org/abs/2603.22435)), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
 
 
 
@@ -132,4 +132,12 @@ The hardcoded entry-pose table in `skills/approach.py` is keyed to a particular 
 
 If you build on this work, please cite the BA thesis it originated from (forthcoming). The CaP-X paper that inspired the design is:
 
-> Fu et al. (2026). *Code as Policies — extended skill library variant.*
+> Fu, M., Yu, J., El-Refai, K., Kou, E., Xue, H., Huang, H., Xiao, W., Wang, G., Fei-Fei, L., Shi, G., Wu, J., Sastry, S., Zhu, Y., Goldberg, K., & Fan, L. (2026). *CaP-X: A Framework for Benchmarking and Improving Coding Agents for Robot Manipulation.* arXiv:2603.22435. https://arxiv.org/abs/2603.22435
+
+## License
+
+See [LICENSE](LICENSE) for details.
+
+## Contributing
+
+Contributions welcome — please open an issue or PR on GitHub.
