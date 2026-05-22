@@ -1,4 +1,10 @@
 # Skill-based architecture
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![ROS 2](https://img.shields.io/badge/ROS%202-Jazzy-22314e)
+![LiteLLM](https://img.shields.io/badge/LiteLLM-provider--agnostic-7e3fa8)
+![MCP](https://img.shields.io/badge/MCP-client-orange)
+![Last commit](https://img.shields.io/github/last-commit/michaljohnson/skill_based)
 
 A deterministic-skills agentic architecture for long-horizon mobile-manipulation tasks on a [Summit XL](https://github.com/icclab/icclab_summit_xl) mobile manipulator (UR5 + Robotiq 2F-140) using ROS 2 Jazzy. Inspired by the CaP-X programmatic skill-abstraction pattern (Fu et al., 2026), implemented as a deliberately less-effort variant: small Python skills wrap the canonical MCP tool sequences for `approach`, `pick`, and `place`, and a planner LLM decides which skill to call next.
 
