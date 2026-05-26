@@ -3,14 +3,48 @@ import json
 import logging
 import os
 import re
+import socket
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import urlparse
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 logger = logging.getLogger(__name__)
+
+# 256-color orange; emitted only when stderr is a real TTY so that
+# piping the run through `tee` keeps the captured log plain.
+_ORANGE = "\033[38;5;208m" if sys.stderr.isatty() else ""
+_RESET = "\033[0m" if sys.stderr.isatty() else ""
+
+
+def _check_server_reachable(server_name: str, url: str, timeout: float = 2.0) -> None:
+    """TCP-probe the MCP server URL. Raise a clear RuntimeError if the port is closed.
+
+    Without this, a missing server surfaces as a cryptic ``asyncio.CancelledError``
+    from a cancel scope inside ``ClientSession.initialize()``, which gives the
+    operator no hint that the underlying cause is a dead server process.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port
+    if port is None:
+        return
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return
+    except (OSError, socket.timeout) as e:
+        msg = (
+            f"MCP server '{server_name}' is not reachable at {url} ({e}). "
+            f"Start the robot MCP stack with: "
+            f"cd /home/ros/rap && ./start_mcp_servers.sh --stop && ./start_mcp_servers.sh "
+            f"(then wait ~10s for all four servers to bind)."
+        )
+        print(f"{_ORANGE}[ERROR] {msg}{_RESET}", file=sys.stderr)
+        raise RuntimeError(msg) from e
 
 def _find_mcp_config() -> Path:
     """Locate ``.mcp.json``.
@@ -92,6 +126,7 @@ class MCPClient:
                     f"Skipping {server_name}: no URL (stdio transport not supported)"
                 )
                 continue
+            _check_server_reachable(server_name, url)
             try:
                 transport = await self._exit_stack.enter_async_context(
                     streamablehttp_client(url=url, timeout=30)
@@ -100,7 +135,7 @@ class MCPClient:
                 session = await self._exit_stack.enter_async_context(
                     ClientSession(read_stream, write_stream)
                 )
-                await session.initialize()
+                await asyncio.wait_for(session.initialize(), timeout=15.0)
 
                 result = await session.list_tools()
                 self._sessions[server_name] = session
@@ -109,6 +144,15 @@ class MCPClient:
                 short = SERVER_SHORT_NAMES.get(server_name, server_name)
                 tool_names = [t.name for t in result.tools]
                 logger.info(f"Connected to {server_name} ({short}): {tool_names}")
+            except asyncio.TimeoutError as e:
+                raise RuntimeError(
+                    f"MCP server '{server_name}' at {url} accepted the TCP "
+                    f"connection but did not complete the MCP handshake within 15s. "
+                    f"This usually means the server process is stuck or holds "
+                    f"stale rclpy handles after a Gazebo restart. Restart the "
+                    f"stack with: cd /home/ros/rap && ./start_mcp_servers.sh --stop "
+                    f"&& ./start_mcp_servers.sh"
+                ) from e
             except Exception as e:
                 logger.error(f"Failed to connect to {server_name} at {url}: {e}")
                 raise
