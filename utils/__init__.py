@@ -61,7 +61,16 @@ def geometric_fallback_prompts(target: str) -> list[str]:
         prompts.append("brown bucket")
         prompts.append("dark opening on the floor")
     elif "table" in t or "counter" in t or "shelf" in t or "desk" in t:
-        prompts.append("wooden surface")
+        # "wooden surface" is NOT used as a fallback: SAM3 has no
+        # distance-plausibility gate and the generic prompt latches onto
+        # far wooden objects (kitchen counters through doorways, distant
+        # wood floors), producing multi-metre bbox.x_min values that the
+        # approach drive then refuses. Use class-specific alternatives
+        # that anchor on the close intended target.
+        prompts.append("wooden coffee table")
+        prompts.append("coffee table")
+        prompts.append("wooden table")
+        prompts.append("low wooden table")
     elif "shoe rack" in t:
         prompts.append("red shoe on the floor")
     elif "cube" in t:
