@@ -19,7 +19,23 @@ import re
 import time
 import uuid
 
-import litellm
+# Silence LiteLLM's import-time warnings for optional AWS adapters we do not
+# use (Bedrock and SageMaker need botocore which is not installed). Must be
+# registered BEFORE `import litellm` so the warnings emitted on import are
+# filtered out.
+class _LitellmAwsWarningFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return not (
+            "bedrock-runtime" in msg
+            or "sagemaker-runtime" in msg
+            or "No module named 'botocore'" in msg
+        )
+
+
+logging.getLogger("LiteLLM").addFilter(_LitellmAwsWarningFilter())
+
+import litellm  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
