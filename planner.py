@@ -219,7 +219,7 @@ async def run_planner(
     mcp: MCPClient,
     task: str,
     model: str | None = None,
-    max_turns: int = 30,
+    max_turns: int = 50,
 ) -> dict:
     """Run the planner LLM on a natural-language task.
 
@@ -238,10 +238,16 @@ async def run_planner(
         {"role": "user", "content": task},
     ]
     skill_tool_calls_total = 0
+    llm_prompt_tokens = 0
+    llm_completion_tokens = 0
 
     for turn in range(max_turns):
         logger.info(f"=== PLANNER decision {turn + 1}/{max_turns} ===")
         response = call_llm(messages=messages, tools=PLANNER_TOOLS, model=model)
+        _usage = getattr(response, "usage", None)
+        if _usage is not None:
+            llm_prompt_tokens += getattr(_usage, "prompt_tokens", 0) or 0
+            llm_completion_tokens += getattr(_usage, "completion_tokens", 0) or 0
 
         messages.append(assistant_message(response))
 
@@ -251,6 +257,9 @@ async def run_planner(
                 "summary": text,
                 "turns_used": turn + 1,
                 "skill_tool_calls_total": skill_tool_calls_total,
+                "llm_prompt_tokens": llm_prompt_tokens,
+                "llm_completion_tokens": llm_completion_tokens,
+                "llm_total_tokens": llm_prompt_tokens + llm_completion_tokens,
                 "success": True,
             }
 
@@ -279,5 +288,8 @@ async def run_planner(
         "summary": "max planner turns exceeded",
         "turns_used": max_turns,
         "skill_tool_calls_total": skill_tool_calls_total,
+        "llm_prompt_tokens": llm_prompt_tokens,
+        "llm_completion_tokens": llm_completion_tokens,
+        "llm_total_tokens": llm_prompt_tokens + llm_completion_tokens,
         "success": False,
     }

@@ -114,6 +114,7 @@ async def run_full(task: str) -> None:
         print(f"\nPlanner decisions made:    {result['turns_used']}")
         print(f"Skill tool calls total:    {result['skill_tool_calls_total']}")
         print(f"Wall-clock total:          {wall_seconds}s ({wall_seconds / 60:.1f} min)")
+        print(f"LLM tokens total:          {result.get('llm_total_tokens', 0)} ({result.get('llm_prompt_tokens', 0)} prompt + {result.get('llm_completion_tokens', 0)} completion)")
 
 
 def main() -> None:

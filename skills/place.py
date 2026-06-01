@@ -48,7 +48,7 @@ _VALID_MODES: tuple[str, ...] = ("container", "surface", "floor")
 # Reach budgets and lift / clearance constants. Per-mode values are
 # selected by _mode_config() below; the raw constants live here so they
 # can be overridden in future tuning sweeps without touching dispatch.
-CONTAINER_REACH_XY = 0.78
+CONTAINER_REACH_XY = 0.80  # bumped from 0.78 (demo-prep, out of frozen matrix): valid container drops near 0.79 m were rejected by a hair though the UR5e reaches them.
 SURFACE_REACH_XY = 0.85
 # Floor mode drops happen at z ≈ 0.41 m (= 0 + 0.14 finger + held_h +
 # 0.15 clearance) — much lower than surface (~0.68 m) or container
@@ -81,6 +81,12 @@ class _ModeConfig:
     pp_top_clearance_m: float
     pp_object_height_m: float
     pp_x_bias_m: float
+    # When > 0 the perception MCP places at bbox.x_min + near_edge_inset_m
+    # (near-edge mode) instead of centroid + x_bias_m. Required for wide
+    # surfaces (coffee tables, desks) whose geometric centroid sits beyond
+    # the UR5e top-down reach envelope. Container mode does NOT need this
+    # because the segmented rim is roughly the centroid for narrow bins.
+    pp_near_edge_inset_m: float
     # Post-segment behaviour
     reach_gate_xy: float
     post_release_lift_m: float
@@ -108,6 +114,7 @@ def _mode_config(mode: Mode, object_height_m: float) -> _ModeConfig:
             pp_top_clearance_m=0.35,
             pp_object_height_m=0.0,        # tells perception MCP to use container math
             pp_x_bias_m=0.08,              # compensate front-cam NEAR bias on bin
+            pp_near_edge_inset_m=0.0,      # bins are narrow; centroid + x_bias is fine
             reach_gate_xy=CONTAINER_REACH_XY,
             post_release_lift_m=POST_RELEASE_LIFT_M_CONTAINER,
             overrides_drop_pose=False,
@@ -116,9 +123,13 @@ def _mode_config(mode: Mode, object_height_m: float) -> _ModeConfig:
         )
     if mode == "surface":
         return _ModeConfig(
-            pp_top_clearance_m=0.15,       # 15cm above surface for gravity decoupling
+            pp_top_clearance_m=0.05,       # 5cm above surface so the can falls clear of the gripper (matches multi_agent; was 0.03)
             pp_object_height_m=object_height_m,
-            pp_x_bias_m=0.10,              # compensate front-cam NEAR bias on table
+            pp_x_bias_m=0.0,               # ignored when near_edge_inset_m > 0
+            pp_near_edge_inset_m=0.15,     # place at bbox.x_min + 0.15m (near-edge mode);
+                                           # required for wide surfaces whose geometric centroid
+                                           # lies beyond UR5e reach. 15cm keeps the drop well
+                                           # clear of the near rim.
             reach_gate_xy=SURFACE_REACH_XY,
             post_release_lift_m=POST_RELEASE_LIFT_M_SURFACE,
             overrides_drop_pose=False,
@@ -136,6 +147,7 @@ def _mode_config(mode: Mode, object_height_m: float) -> _ModeConfig:
             pp_top_clearance_m=0.0,        # ignored; we override the drop pose
             pp_object_height_m=0.0,        # use container-mode math (cheaper, returns centroid)
             pp_x_bias_m=0.0,               # we offset ourselves
+            pp_near_edge_inset_m=0.0,      # we override the drop pose
             reach_gate_xy=FLOOR_REACH_XY,  # wider envelope at low drop z
             post_release_lift_m=POST_RELEASE_LIFT_M_SURFACE,
             overrides_drop_pose=True,
@@ -187,6 +199,7 @@ async def _placing_pose(
                 "top_clearance_m": cfg.pp_top_clearance_m,
                 "object_height_m": cfg.pp_object_height_m,
                 "x_bias_m": cfg.pp_x_bias_m,
+                "near_edge_inset_m": cfg.pp_near_edge_inset_m,
             },
         )
         data = json.loads(raw) if isinstance(raw, str) else raw
@@ -407,13 +420,31 @@ async def _verify_object_visible_from_above(
     look_forward — at look_forward the wrist camera points sideways,
     not down.
     """
-    status, calls = await _segment(mcp, object_name, camera="arm")
-    if status == "SUCCESS":
-        return True, f"'{object_name}' visible on arm camera at drop pose", calls
+    # Detach lag (Gazebo DynamicGripperAttach): the released object can ride
+    # up with the gripper on the post-release lift and settle onto the surface
+    # only a few seconds later. Wait, verify, retry once — so a delayed but
+    # correct drop is not false-negatived. (Demo-prep robustness; out of the
+    # frozen evaluation matrix.)
+    calls = 0
+    status = "ERROR"
+    for attempt in range(2):
+        await asyncio.sleep(3.0)
+        status, c = await _segment(mcp, object_name, camera="arm")
+        calls += c
+        logger.info(
+            f"  [place-verify {attempt+1}/2] arm SAM3 '{object_name}' -> {status}"
+        )
+        if status == "SUCCESS":
+            return (
+                True,
+                f"'{object_name}' visible on arm camera at drop pose "
+                f"(settled, attempt {attempt+1})",
+                calls,
+            )
     return (
         False,
-        f"'{object_name}' NOT visible on arm camera at drop pose "
-        f"(seg status: {status}) — likely missed target / fell elsewhere",
+        f"'{object_name}' NOT visible on arm camera at drop pose after "
+        f"settle+retry (seg status: {status}) — likely missed target / fell elsewhere",
         calls,
     )
 
@@ -537,43 +568,69 @@ async def run(
                 seg_ok = True
                 seg_camera = "arm"
                 break
+    floor_fixed_fallback = False
     if not seg_ok:
-        return {
-            **base_result,
-            "success": False,
-            "reason": (
-                f"both-camera segmentation failed for '{target_location}' "
-                f"and fallbacks {fallbacks[1:]}"
-            ),
-            "tool_calls_used": tool_calls,
-        }
+        if mode == "floor":
+            # Floor fallback: if the reference object cannot be segmented on
+            # either camera, drop the held object at a fixed pose directly in
+            # front of the robot rather than hard-failing (mirrors the fixed
+            # forward floor drop in multi_agent). Demo-prep robustness; out of
+            # the frozen evaluation matrix.
+            floor_fixed_fallback = True
+            logger.warning(
+                f"floor mode: reference '{target_location}' not segmentable on "
+                f"either camera; falling back to a fixed forward floor drop"
+            )
+        else:
+            return {
+                **base_result,
+                "success": False,
+                "reason": (
+                    f"both-camera segmentation failed for '{target_location}' "
+                    f"and fallbacks {fallbacks[1:]}"
+                ),
+                "tool_calls_used": tool_calls,
+            }
 
-    # Step 3b — coarse placing pose from whichever camera anchored
-    pc_topic = (
-        "/front/segmented_pointcloud" if seg_camera == "front"
-        else "/segmented_pointcloud"
-    )
-    coarse, calls = await _placing_pose(
-        mcp,
-        target_location,
-        cfg=cfg,
-        pointcloud_topic=pc_topic,
-    )
-    tool_calls += calls
-    if coarse is None:
-        return {
-            **base_result,
-            "success": False,
-            "reason": "placing pose computation failed",
-            "tool_calls_used": tool_calls,
-        }
+    # Step 3b — coarse placing pose from whichever camera anchored.
+    # Skipped in the floor fixed-fallback path (no reference was segmented).
+    coarse = None
+    if not floor_fixed_fallback:
+        pc_topic = (
+            "/front/segmented_pointcloud" if seg_camera == "front"
+            else "/segmented_pointcloud"
+        )
+        coarse, calls = await _placing_pose(
+            mcp,
+            target_location,
+            cfg=cfg,
+            pointcloud_topic=pc_topic,
+        )
+        tool_calls += calls
+        if coarse is None:
+            return {
+                **base_result,
+                "success": False,
+                "reason": "placing pose computation failed",
+                "tool_calls_used": tool_calls,
+            }
 
     # Drop pose dispatch:
     #   - container / surface: use perception MCP's place_pose directly.
     #   - floor:               override with reference_centroid + lateral
     #                          offset; z = floor + finger + held_h +
     #                          clearance (placing NEXT TO reference, not ON).
-    if cfg.overrides_drop_pose:  # floor mode
+    if floor_fixed_fallback:
+        # Fixed forward floor drop (reference not segmented): directly in
+        # front of the robot, within the UR5e low-z reach envelope.
+        cx = 0.40
+        cy = 0.0
+        cz = 0.0 + 0.14 + object_height_m + FLOOR_DROP_CLEARANCE_M
+        logger.info(
+            f"floor FIXED-fallback pose=({cx:.2f},{cy:.2f},{cz:.2f}) "
+            f"(reference not found, dropping in front)"
+        )
+    elif cfg.overrides_drop_pose:  # floor mode with a segmented reference
         ref = coarse.get("surface_centroid", {})
         try:
             ref_x = float(ref["x"])

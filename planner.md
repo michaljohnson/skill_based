@@ -70,10 +70,11 @@ When a skill returns `success=false`, look at the `reason` string and pick the n
 
 | `reason` contains                              | Next action                                                                                          |
 |------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| `attach verify failed` / `gripper not attached`| **End the task**: output the failure as plain text (no tool call). Do NOT retry `pick`. Do NOT re-call `approach`. |
+| `attach verify failed` / `gripper not attached`| **Recover, do not end immediately.** The grasp likely missed (for example an elevated segmentation centroid placed the gripper above the object). Call `approach` again with the same args (this re-positions the base and tucks the arm back to `look_forward`), then call `pick` again so it re-segments from the fresh pose. Attempt this approach+pick recovery up to twice; if it still fails, end the task. |
 | `NO_OBJECTS_FOUND` / `target not in view`      | call `approach` again with the same args (target may be out of FOV).                                 |
 | `out of reach` / `too far` / `drive closer`    | call `approach` again with the same args.                                                            |
-| `plan failed` / `MoveIt` / `IK` / `joint_state`| **End the task**: output the failure as plain text (no tool call). Structural failure; do not loop.  |
+| `NAVIGATION_FAILED` / `drive failed` / `drive on heading` | Transient nav failure (nav2 often drives partway). Call `approach` again with the same args, up to twice, then end. |
+| `plan failed` / `MoveIt` / `IK` / `joint_state`| The skill already retried the plan once internally; this is usually a borderline-reach pose. **Recover once**: call `approach` again with the same args (re-positions a few cm closer and resets the arm to `look_forward`), then re-call the manipulation skill. If it still fails, **end the task** (genuine structural failure). |
 | anything else                                  | **End the task**: output the failure as plain text (no tool call). Unknown failure; do not loop.     |
 
 Hard rules:
