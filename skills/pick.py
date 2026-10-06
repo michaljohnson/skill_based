@@ -351,7 +351,8 @@ async def _plan_to_xyz(
                 "target": {"joint_positions": joints},
             },
         )
-        if "fail" not in result.lower() or "completed" in result.lower():
+        _low = result.lower()
+        if "execution failed" not in _low and "timed out" not in _low and ("fail" not in _low or "completed" in _low):
             return True, result[:200], 3
     except Exception as e:
         return False, f"plan_and_execute(joint_state) error: {e}", 3
@@ -384,7 +385,8 @@ async def _plan_to_xyz(
                 "target": {"joint_positions": joints},
             },
         )
-        if "fail" not in result.lower() or "completed" in result.lower():
+        _low = result.lower()
+        if "execution failed" not in _low and "timed out" not in _low and ("fail" not in _low or "completed" in _low):
             return True, f"retry ok: {result[:200]}", 6
         return False, f"retry still failed: {result[:200]}", 6
     except Exception as e:

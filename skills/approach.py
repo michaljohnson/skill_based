@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 
 from skill_based.clients.mcp import MCPClient
 from skill_based.utils import (
@@ -72,6 +73,46 @@ def _parse_robot_pose(raw) -> tuple[float | None, float | None, float | None]:
         return float(pos["x"]), float(pos["y"]), float(ori["yaw"])
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None, None, None
+
+
+# Max range (metres, base frame) at which a segmentation is accepted as
+# THE approach target. Beyond this the hit is almost certainly a wrong far
+# object (ungated SAM3 latching a bin / surface elsewhere in the house),
+# which the last-metre drive primitive cannot reach anyway, so committing
+# to it only earns a typed refusal from nav2__approach_target. Rejecting it
+# lets the search keep looking for the in-range target. Legit entry-pose
+# detections sit ~2.5 m out; far phantoms in this house measure 9-13 m.
+# Override via SKILL_MAX_ACCEPT_RANGE_M for tuning / A-B.
+MAX_ACCEPT_RANGE_M = float(os.environ.get("SKILL_MAX_ACCEPT_RANGE_M", "4.0"))
+
+
+async def _detection_in_range(
+    mcp: MCPClient, max_range_m: float = MAX_ACCEPT_RANGE_M
+) -> tuple[bool, float | None]:
+    """Gate the LAST segmentation by its base-frame centroid distance.
+
+    ``get_topdown_grasp_pose`` reads the cached point cloud from the most
+    recent ``segment_objects`` call, so this reflects whatever prompt just
+    reported SUCCESS. Returns ``(accept, dist_m)``. Fails OPEN (accept,
+    ``None``) when the distance cannot be read, so a transient perception
+    hiccup never blocks an otherwise-valid approach.
+    """
+    try:
+        raw = await mcp.call_tool_prefixed(
+            "perception__get_topdown_grasp_pose", {"object_name": "target"}
+        )
+        g = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(g, dict):
+            g = g.get("result", g)
+        if isinstance(g, str):
+            g = json.loads(g)
+        c = g.get("centroid_base_frame") if isinstance(g, dict) else None
+        if not c:
+            return True, None
+        dist = math.hypot(float(c["x"]), float(c["y"]))
+        return (dist <= max_range_m), dist
+    except Exception:
+        return True, None
 
 
 async def approach_target(
@@ -276,8 +317,18 @@ async def spin_search(
                 tool_calls += 1
                 continue
             if status == "SUCCESS":
-                anchored = True
-                break
+                # Distance gate: reject a far phantom (e.g. a bin across the
+                # house) so the sweep keeps looking for the in-range target
+                # instead of committing to a hit approach_target will refuse.
+                in_range, dist = await _detection_in_range(mcp)
+                tool_calls += 1
+                if in_range:
+                    anchored = True
+                    break
+                logger.info(
+                    f"  [spin-search {i+1}/{max_spins}] '{prompt}' at "
+                    f"{dist:.1f}m > {MAX_ACCEPT_RANGE_M:.1f}m — far phantom, rejected"
+                )
         if anchored:
             return {
                 "success": True,
@@ -311,12 +362,58 @@ NAMED_AREA_POSES: dict[str, dict[str, float]] = {
     "kitchen": {"x": 5.14, "y": -0.86, "yaw": -0.52},
     "dining": {"x": 5.15, "y": -0.86, "yaw": 0.80},
     "dining area": {"x": 5.15, "y": -0.86, "yaw": 0.80},
+    # Dock pose ~1.1 m due-north of the living-room trash bin
+    # (LivingRoom_Trash at 3.11,-4.84), facing south so the front camera
+    # frames the bin against the south wall with the coffee table fully
+    # out of view. Reachable as an explicit target_area too, in case the
+    # planner phrases the bin as the area. (Demo-prep, out of the frozen
+    # matrix — see _LANDMARK_DOCK_POSES below for the object-name route.)
+    "living room bin": {"x": 3.10, "y": -3.00, "yaw": -1.5708},
+    "living room trash": {"x": 3.10, "y": -3.00, "yaw": -1.5708},
+    "living room trash bin": {"x": 3.10, "y": -3.00, "yaw": -1.5708},
 }
+
+
+# === Landmark docking poses (object-name keyed) ===
+#
+# A small open-weights planner usually passes the ROOM as target_area
+# ("living room") and the CONTAINER as object_name ("trash bin"). The
+# living-room entry pose sits ~4.7 m from the bin, far out of front-camera
+# range, so the bin approach used to fall through to spin-search and wedge
+# the base against the coffee table. When object_name names a known
+# landmark, drive straight to that landmark's docking pose instead of the
+# room entry pose, independent of how the planner phrased the room. Keys
+# are matched as whole-word tokens against the normalised object_name.
+# (Demo-prep, out of the frozen evaluation matrix.)
+_LANDMARK_DOCK_POSES: dict[str, dict[str, float]] = {
+    "trash bin": {"x": 3.10, "y": -3.00, "yaw": -1.5708},
+}
+# Object-name tokens that route to the trash-bin dock pose.
+_BIN_TOKENS = ("trash", "bin", "wastebasket", "wastebin")
 
 
 def _resolve_target_area(name: str) -> dict[str, float] | None:
     key = " ".join(name.lower().replace("_", " ").split())
     return NAMED_AREA_POSES.get(key)
+
+
+def _resolve_landmark_dock(object_name: str) -> dict[str, float] | None:
+    """Return a docking pose if ``object_name`` names a known landmark.
+
+    Matches the trash bin by token so phrasings like "trash bin",
+    "brown trash bin", or "bin" all route to the bin dock pose. Returns
+    ``None`` (no override) for ordinary pick/place targets.
+
+    Set ``SKILL_DISABLE_LANDMARK_DOCK=1`` in the environment to disable
+    the override entirely (A/B baseline: exercise the general
+    room-entry + segment + spin-search path with no hardcoded pose).
+    """
+    if os.environ.get("SKILL_DISABLE_LANDMARK_DOCK", "").strip() not in ("", "0", "false", "False"):
+        return None
+    tokens = set(object_name.lower().replace("_", " ").split())
+    if tokens & set(_BIN_TOKENS):
+        return _LANDMARK_DOCK_POSES["trash bin"]
+    return None
 
 
 async def run(
@@ -367,6 +464,16 @@ async def run(
             ),
             "tool_calls_used": tool_calls,
         }
+
+    # Landmark override: if the target object is a known landmark (the
+    # trash bin), dock at its dedicated pose rather than the room entry
+    # pose. This decouples the bin approach from how the planner phrased
+    # the room and keeps the bin in front-camera range so the base never
+    # has to spin-search (which previously wedged it against the coffee
+    # table). Demo-prep, out of the frozen evaluation matrix.
+    dock = _resolve_landmark_dock(object_name)
+    if dock is not None and dock != pose:
+        pose = dock
 
     standoff_m = STANDOFF_BY_NEXT_ACTION[next_action]
     logger.info(
@@ -458,8 +565,18 @@ async def run(
                 logger.error(f"{camera_try}-cam SAM3 error: {e}")
                 tool_calls += 1
             if status == "SUCCESS":
-                seg_camera = camera_try
-                break
+                # Same distance gate as spin_search: do not accept a far
+                # phantom even if it is the first SAM3 hit from the entry pose.
+                in_range, dist = await _detection_in_range(mcp)
+                tool_calls += 1
+                if in_range:
+                    seg_camera = camera_try
+                    break
+                logger.info(
+                    f"{camera_try}-cam '{prompt}' at {dist:.1f}m > "
+                    f"{MAX_ACCEPT_RANGE_M:.1f}m — far phantom, rejected; continuing"
+                )
+                status = "OUT_OF_RANGE"
         if status == "SUCCESS":
             break
 
@@ -484,20 +601,33 @@ async def run(
             seg_camera = "arm"
 
     # Step 5 — Drive to standoff distance from segmented target.
-    # If detection happened on the arm cam, the robot is already at close
-    # range (arm cam sees within ~0.6m); approach_target reads the front
-    # cam's pointcloud cache and would have nothing to plan against. Skip
-    # the drive and report success at current pose so pick can proceed.
+    # If the arm-cam detection is genuinely within reach, the robot is
+    # already at close range and approach_target has nothing to creep
+    # toward, so report success at the current pose. But if the arm-cam
+    # target is still beyond standoff (front cam missed it and the base is
+    # parked too far), skipping the drive strands the robot outside the
+    # downstream reach gate (e.g. the 0.80 m container place gate) — and
+    # re-approaching just re-detects and re-skips, an unrecoverable loop.
+    # In that case fall through to approach_target and creep to standoff.
     if seg_camera == "arm":
         await wait_until_still(mcp, timeout=2.0)
-        return {
-            "success": True,
-            "reason": (
-                f"'{object_name}' detected on arm cam at '{target_area}'; "
-                f"already at close range, skipping standoff drive"
-            ),
-            "tool_calls_used": tool_calls,
-        }
+        in_reach, arm_dist = await _detection_in_range(
+            mcp, max_range_m=standoff_m + 0.10
+        )
+        tool_calls += 1
+        if in_reach:
+            return {
+                "success": True,
+                "reason": (
+                    f"'{object_name}' detected on arm cam at '{target_area}'; "
+                    f"already at close range, skipping standoff drive"
+                ),
+                "tool_calls_used": tool_calls,
+            }
+        logger.info(
+            f"arm-cam '{object_name}' at {arm_dist:.2f}m > reach "
+            f"{standoff_m + 0.10:.2f}m; creeping to standoff instead of skipping"
+        )
     approach = await approach_target(mcp, object_name, standoff_m=standoff_m)
     tool_calls += approach.get("tool_calls_used", 0)
     if not approach.get("success"):

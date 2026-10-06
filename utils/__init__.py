@@ -99,7 +99,8 @@ async def move_arm_to_look_forward(mcp: MCPClient) -> dict:
                 "target": {"joint_positions": LOOK_FORWARD_JOINTS},
             },
         )
-        if "fail" not in result.lower() or "completed" in result.lower():
+        _low = result.lower()
+        if "execution failed" not in _low and "timed out" not in _low and ("fail" not in _low or "completed" in _low):
             return {"success": True, "reason": "joint_state look_forward", "raw": result[:200]}
     except Exception as e:
         # Swallow and try fallback; caller sees outcome via the return dict.
@@ -117,7 +118,8 @@ async def move_arm_to_look_forward(mcp: MCPClient) -> dict:
                 "target": {"state_name": "look_forward"},
             },
         )
-        if "fail" not in result.lower() or "completed" in result.lower():
+        _low = result.lower()
+        if "execution failed" not in _low and "timed out" not in _low and ("fail" not in _low or "completed" in _low):
             return {
                 "success": True,
                 "reason": "named_state look_forward (joint_state fallback)",
