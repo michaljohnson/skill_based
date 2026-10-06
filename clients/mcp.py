@@ -40,7 +40,7 @@ def _check_server_reachable(server_name: str, url: str, timeout: float = 2.0) ->
         msg = (
             f"MCP server '{server_name}' is not reachable at {url} ({e}). "
             f"Start the robot MCP stack with: "
-            f"cd /home/ros/rap && ./start_mcp_servers.sh --stop && ./start_mcp_servers.sh "
+            f"~/rap/scripts/start_mcp_servers.sh --stop && ~/rap/scripts/start_mcp_servers.sh "
             f"(then wait ~10s for all four servers to bind)."
         )
         print(f"{_ORANGE}[ERROR] {msg}{_RESET}", file=sys.stderr)
@@ -150,8 +150,8 @@ class MCPClient:
                     f"connection but did not complete the MCP handshake within 15s. "
                     f"This usually means the server process is stuck or holds "
                     f"stale rclpy handles after a Gazebo restart. Restart the "
-                    f"stack with: cd /home/ros/rap && ./start_mcp_servers.sh --stop "
-                    f"&& ./start_mcp_servers.sh"
+                    f"stack with: ~/rap/scripts/start_mcp_servers.sh --stop "
+                    f"&& ~/rap/scripts/start_mcp_servers.sh"
                 ) from e
             except Exception as e:
                 logger.error(f"Failed to connect to {server_name} at {url}: {e}")
