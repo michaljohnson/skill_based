@@ -63,6 +63,7 @@ async def test_place(
     object_name: str,
     mode: str,
     object_height_m: float,
+    pads_above_bottom_m: float | None = None,
 ) -> None:
     print(
         f"\n=== Testing place skill: target='{target_location}' "
@@ -76,6 +77,7 @@ async def test_place(
             object_name=object_name,
             mode=mode,
             object_height_m=object_height_m,
+            pads_above_bottom_m=pads_above_bottom_m,
         )
         result["wall_seconds"] = round(time.perf_counter() - t0, 2)
         print(f"\n=== Result ===")
@@ -175,6 +177,16 @@ def main() -> None:
             "Held object height in metres (from pick.held_object_height_m). "
             "Required with --test-place when --mode=surface or --mode=floor. "
             "Ignored for --mode=container."
+        ),
+    )
+    parser.add_argument(
+        "--pads-above-bottom-m",
+        type=float,
+        default=None,
+        help=(
+            "How far the finger pads sit above the held object's bottom "
+            "(from pick.pads_above_bottom_m). Optional; surface mode then sets "
+            "the object down instead of dropping it from a few cm."
         ),
     )
     parser.add_argument(
@@ -279,6 +291,7 @@ def main() -> None:
             args.object_name,
             args.mode,
             args.object_height_m,
+            args.pads_above_bottom_m,
         ))
     elif args.test_approach:
         if not args.object_name:

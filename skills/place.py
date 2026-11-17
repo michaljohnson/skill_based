@@ -3,12 +3,13 @@
 The planner picks the mode with the ``mode`` argument:
 
   container  drop INTO a bin or basket: flange 35 cm above the segmented rim,
-             the held object falls in. Adapted to the real robot.
-  surface    put ON a table or shelf.  Not adapted to the real robot yet.
+             the held object falls in.
+  surface    put ON a table or box: the object's bottom ends a few cm above
+             the segmented top, then the gripper opens.
   floor      put NEXT TO an object on the floor.  Not adapted yet.
 
-Surface and floor need the held object's height, which pick returns as
-``held_object_height_m``; container mode ignores it. Their simulation
+Surface needs the held object's height, which pick returns as
+``held_object_height_m``; container mode ignores it. Floor's simulation
 version is in git history (branch ``summit``) as a template.
 """
 
@@ -111,11 +112,27 @@ async def _verify_object_visible_from_above(
 # Container mode on the real robot. Flange this far above the rim: the held
 # object's bottom then clears the rim by ~10 cm (pads ~6 cm above its bottom).
 CONTAINER_RIM_CLEARANCE_M = 0.35
-# Reach to the bin centre from base_footprint; a drop at 0.95 m planned with the
+# Reach to the drop point from base_footprint; a drop at 0.95 m planned with the
 # elbow bent, at 1.08 m it was nearly straight.
 CONTAINER_REACH_REAL_M = 1.00
 # Footprint of the bin's collision box; keeps the arm off the rim on the way.
 CONTAINER_BOX_M = 0.40
+
+# Surface mode. Flange to the middle of the finger pads (perception's GRIPPER_FINGER_OFFSET_M).
+PAD_OFFSET_M = 0.188
+# Object bottom this far above the top when the gripper opens. The top is the highest point
+# of the cloud, which depth noise puts ~1 cm above the real surface. Pick measures how far
+# the pads sit above the object's bottom; without that the object is counted as hanging
+# fully below the pads, with more clearance.
+SURFACE_CLEARANCE_M = 0.005
+SURFACE_CLEARANCE_UNMEASURED_M = 0.03
+# The flange goes this far above the drop pose first, then straight down.
+SURFACE_APPROACH_M = 0.08
+# A top lower than this is the floor (floor mode); higher is out of top-down reach.
+SURFACE_TOP_MIN_M = 0.05
+SURFACE_TOP_MAX_M = 0.80
+# A surface whose middle is out of reach gets the object this far behind its near edge.
+SURFACE_EDGE_INSET_M = 0.15
 
 
 async def _segment_any(
@@ -133,14 +150,20 @@ async def _segment_any(
     return None, calls
 
 
-async def _run_container(mcp: MCPClient, target_location: str, object_name: str) -> dict:
-    """Drop the held object into a container in front of the robot.
+async def _run_drop(
+    mcp: MCPClient,
+    target_location: str,
+    object_name: str,
+    mode: Mode,
+    object_height_m: float,
+    pads_above_bottom_m: float | None = None,
+) -> dict:
+    """Release the held object into a container or onto a surface in front of the robot.
 
-    The bin's centre comes from the grasp tool's near-face rule on the bin
-    cloud (the placing tool's point mean is pulled metres away by stray depth
-    points on a dark bin); its rim from the highest bin points. The bin goes
-    into the planning scene, the flange goes straight to rim + clearance, the
-    gripper opens and the arm camera checks the object from above.
+    Both modes segment the target, measure it with the grasp tool (near-face
+    centre, top from the highest points), add it to the planning scene, move the
+    flange straight to the drop point, open the gripper and check the object
+    from above with the arm camera. They differ only in the drop point and the box.
     """
     tool_calls = 0
     base = {"target_location": target_location}
@@ -148,7 +171,9 @@ async def _run_container(mcp: MCPClient, target_location: str, object_name: str)
     def fail(reason: str) -> dict:
         return {**base, "success": False, "reason": reason, "tool_calls_used": tool_calls}
 
-    logger.info(f"place -> container '{target_location}' object='{object_name}'")
+    logger.info(f"place -> {mode} '{target_location}' object='{object_name}' obj_h={object_height_m:.3f}")
+    if mode == "surface" and not object_height_m > 0:
+        return fail("surface mode needs the held object's height: pass pick's held_object_height_m")
 
     finger = await gripper_position(mcp)
     tool_calls += 1
@@ -179,50 +204,68 @@ async def _run_container(mcp: MCPClient, target_location: str, object_name: str)
         data = json.loads(raw) if isinstance(raw, str) else raw
         cx = float(data["grasp_pose"]["position"]["x"])
         cy = float(data["grasp_pose"]["position"]["y"])
-        rim = float(data["bbox_base_frame"]["z_max"])
+        top = float(data["bbox_base_frame"]["z_max"])
+        if mode == "surface":
+            bbox = {k: float(data["bbox_base_frame"][k]) for k in ("x_min", "x_max", "y_min", "y_max")}
     except Exception as e:
-        return fail(f"no container pose from the segmented cloud: {e}")
+        return fail(f"no {mode} pose from the segmented cloud: {e}")
     tool_calls += 1
-    drop_z = rim + CONTAINER_RIM_CLEARANCE_M
+
+    if mode == "container":
+        drop_z = top + CONTAINER_RIM_CLEARANCE_M
+        box_pos = [cx, cy, top / 2]
+        box_dim = [CONTAINER_BOX_M, CONTAINER_BOX_M, top]
+    else:
+        if not SURFACE_TOP_MIN_M <= top <= SURFACE_TOP_MAX_M:
+            return fail(
+                f"surface top at {top:.2f} m is outside {SURFACE_TOP_MIN_M:.2f}-{SURFACE_TOP_MAX_M:.2f} m "
+                "(lower: use floor mode; higher: out of top-down reach)"
+            )
+        if (cx ** 2 + cy ** 2) ** 0.5 > CONTAINER_REACH_REAL_M:
+            cx = min(cx, bbox["x_min"] + SURFACE_EDGE_INSET_M)
+        if pads_above_bottom_m is not None and 0 < pads_above_bottom_m <= object_height_m:
+            drop_z = top + SURFACE_CLEARANCE_M + pads_above_bottom_m + PAD_OFFSET_M
+        else:
+            drop_z = top + SURFACE_CLEARANCE_UNMEASURED_M + object_height_m + PAD_OFFSET_M
+        box_pos = [(bbox["x_min"] + bbox["x_max"]) / 2, (bbox["y_min"] + bbox["y_max"]) / 2, top / 2]
+        box_dim = [bbox["x_max"] - bbox["x_min"], bbox["y_max"] - bbox["y_min"], top]
+
     dist = (cx ** 2 + cy ** 2) ** 0.5
-    logger.info(f"container centre=({cx:.3f},{cy:.3f}) rim={rim:.3f} drop_z={drop_z:.3f} dist={dist:.2f}")
+    logger.info(f"{mode} drop=({cx:.3f},{cy:.3f}) top={top:.3f} drop_z={drop_z:.3f} dist={dist:.2f}")
     if dist > CONTAINER_REACH_REAL_M:
         return fail(
-            f"container at {dist:.2f} m > {CONTAINER_REACH_REAL_M:.2f} m. "
+            f"{mode} at {dist:.2f} m > {CONTAINER_REACH_REAL_M:.2f} m. "
             "Navigator must redeliver closer."
         )
 
     try:
         reply = await mcp.call_tool_prefixed(
             "moveit__add_collision_box",
-            {
-                "object_id": "container",
-                "position": [cx, cy, rim / 2],
-                "dimensions": [CONTAINER_BOX_M, CONTAINER_BOX_M, rim],
-                "frame_id": "base_footprint",
-            },
+            {"object_id": mode, "position": box_pos, "dimensions": box_dim, "frame_id": "base_footprint"},
         )
         if not str(reply).startswith("Successfully"):
             raise RuntimeError(str(reply)[:200])
     except Exception as e:
         await move_arm_to_look_forward(mcp)
-        return fail(f"container collision box not added: {e}")
+        return fail(f"{mode} collision box not added: {e}")
     tool_calls += 1
 
-    ok, info, calls = await plan_to_xyz(mcp, cx, cy, drop_z, _TOPDOWN, reset_on_retry=False)
-    tool_calls += calls
-    if not ok:
-        await move_arm_to_look_forward(mcp)
-        tool_calls += 1
-        return fail(f"drop pose plan failed: {info}")
+    stops = [drop_z + SURFACE_APPROACH_M, drop_z] if mode == "surface" else [drop_z]
+    for z in stops:
+        ok, info, calls = await plan_to_xyz(mcp, cx, cy, z, _TOPDOWN, reset_on_retry=False)
+        tool_calls += calls
+        if not ok:
+            await move_arm_to_look_forward(mcp)
+            tool_calls += 1
+            return fail(f"drop pose plan failed at z={z:.3f}: {info}")
 
     try:
         opened = await gripper_command(mcp, GRIPPER_OPEN)
     except Exception as e:
-        return fail(f"open_gripper error: {e} (arm above the container, object maybe still held)")
+        return fail(f"open_gripper error: {e} (arm above the {mode}, object maybe still held)")
     tool_calls += 1
     if not opened["position"] <= HOLD_MIN:  # also fails on a missing position (NaN)
-        return fail(f"gripper did not open (position {opened['position']:.3f}); arm above the container")
+        return fail(f"gripper did not open (position {opened['position']:.3f}); arm above the {mode}")
 
     visible, vinfo, calls = await _verify_object_visible_from_above(mcp, object_name)
     tool_calls += calls
@@ -234,10 +277,11 @@ async def _run_container(mcp: MCPClient, target_location: str, object_name: str)
         logger.warning(f"post-release look_forward failed: {arm.get('reason')}")
     if not visible:
         return fail(f"placement verify failed: {vinfo}")
+    where = "into" if mode == "container" else "onto"
     return {
         **base,
         "success": True,
-        "reason": f"dropped into {target_location} at ({cx:.2f},{cy:.2f},{drop_z:.2f}); {vinfo}",
+        "reason": f"dropped {where} {target_location} at ({cx:.2f},{cy:.2f},{drop_z:.2f}); {vinfo}",
         "tool_calls_used": tool_calls,
     }
 
@@ -248,6 +292,7 @@ async def run(
     object_name: str,
     mode: Mode,
     object_height_m: float,
+    pads_above_bottom_m: float | None = None,
 ) -> dict:
     """Release the held object at ``target_location`` per ``mode``.
 
@@ -268,9 +313,13 @@ async def run(
         mode: "container" | "surface" | "floor". Selected by the planner
             from task context.
         object_height_m: height of the held object in metres, measured
-            during pick (bounding_box.size.z from the grasp pose). Required
-            by surface and floor modes for wrist-z math; ignored by
-            container mode (it falls THROUGH the opening).
+            during pick (pick's ``held_object_height_m``). Required by
+            surface mode for the drop height; ignored by container mode
+            (the object falls through the opening).
+        pads_above_bottom_m: how far the finger pads sit above the held
+            object's bottom (pick's ``pads_above_bottom_m``). With it, surface
+            mode sets the object down 0.5 cm above the measured top; without it, it
+            assumes the worst case and drops from a few cm higher.
 
     Returns:
         ``{"success": bool, "reason": str, "target_location": str, "tool_calls_used": int}``
@@ -279,12 +328,11 @@ async def run(
         raise ValueError("object_name must be a non-empty string")
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
-    if mode == "container":
-        return await _run_container(mcp, target_location, object_name)
-    # surface and floor still use the simulation's release checks
+    if mode in ("container", "surface"):
+        return await _run_drop(mcp, target_location, object_name, mode, object_height_m, pads_above_bottom_m)
     return {
         "target_location": target_location,
         "success": False,
-        "reason": f"mode={mode!r} is not adapted to the real robot yet (only 'container')",
+        "reason": f"mode={mode!r} is not adapted to the real robot yet (container and surface are)",
         "tool_calls_used": 0,
     }
