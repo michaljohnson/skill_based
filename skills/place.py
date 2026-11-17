@@ -1,160 +1,42 @@
-"""Place skill — deterministic Python release primitive.
+"""Place skill: deterministic release primitive.
 
-Three explicit modes selected by the planner via the ``mode`` argument:
+The planner picks the mode with the ``mode`` argument:
 
-  container  drop INTO a deep target (bin / basket / wastebasket). 35 cm
-             clearance above the segmented rim; held object falls in.
-  surface    drop ON top of an elevated flat target (table / shelf).
-             Wrist z = surface_z + finger + held_h + clearance.
-  floor      drop NEXT TO a reference object on the floor (e.g. shoe
-             beside the other shoe). xy from segmented reference centroid
-             plus a lateral offset; z = floor + finger + held_h +
-             clearance.
+  container  drop INTO a bin or basket: flange 35 cm above the segmented rim,
+             the held object falls in. Adapted to the real robot.
+  surface    put ON a table or shelf.  Not adapted to the real robot yet.
+  floor      put NEXT TO an object on the floor.  Not adapted yet.
 
-The held object's height is REQUIRED and comes from the pick skill's
-returned ``held_object_height_m`` (bounding-box measurement); there is
-no per-object lookup table. Container mode ignores it.
-
-Single-stage placement: segment the target with the front camera
-(coarse but reach-friendly view) and drop straight onto / into / next
-to the returned pose. The earlier two-stage flow (front cam coarse →
-arm cam top-down refine) was removed 2026-05-16 for parity with
-multi_agent/subagents/place.md (which dropped stage-2 on 2026-05-11).
+Surface and floor need the held object's height, which pick returns as
+``held_object_height_m``; container mode ignores it. Their simulation
+version is in git history (branch ``summit``) as a template.
 """
 
 import asyncio
 import json
 import logging
-import re
-from dataclasses import dataclass
 from typing import Literal
 
 from skill_based.clients.mcp import MCPClient
 from skill_based.utils import (
+    GRIPPER_OPEN,
+    HOLD_MAX,
+    HOLD_MIN,
+    TOPDOWN_ORIENTATION as _TOPDOWN,
     geometric_fallback_prompts,
+    gripper_command,
+    gripper_position,
     move_arm_to_look_forward,
     parse_seg_status,
-    wait_until_still,
+    plan_to_xyz,
+    reset_scene,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# === Mode dispatch ===
-
 Mode = Literal["container", "surface", "floor"]
 _VALID_MODES: tuple[str, ...] = ("container", "surface", "floor")
-
-# Reach budgets and lift / clearance constants. Per-mode values are
-# selected by _mode_config() below; the raw constants live here so they
-# can be overridden in future tuning sweeps without touching dispatch.
-CONTAINER_REACH_XY = 0.80  # bumped from 0.78 (demo-prep, out of frozen matrix): valid container drops near 0.79 m were rejected by a hair though the UR5e reaches them.
-SURFACE_REACH_XY = 0.85
-# Floor mode drops happen at z ≈ 0.41 m (= 0 + 0.14 finger + held_h +
-# 0.15 clearance) — much lower than surface (~0.68 m) or container
-# (~0.79 m). The UR5e reach envelope is wider at low z so the gate can
-# be loosened. 1.05 m is a conservative empirical guess; tighten if
-# plans start failing for radials in that range.
-FLOOR_REACH_XY = 1.05
-PRE_PLACE_CLEARANCE_M = 0.10
-POST_RELEASE_LIFT_M_CONTAINER = 0.10
-POST_RELEASE_LIFT_M_SURFACE = 0.20  # also used for floor
-# Floor mode: where to drop the held object relative to the segmented
-# reference. Offset is in -X (towards robot) instead of ±Y (sideways)
-# because the held object then lands BETWEEN the robot and the
-# reference, never PAST the reference. This avoids crashing the arm
-# into geometry just beyond the reference (e.g. the shoe rack behind
-# the floor shoe in the 2026-05-16 first test, where the +0.10 Y
-# offset put the drop pose directly into the rack and the arm pushed
-# the rack aside). 0.15 m is roughly a shoe-length of spacing.
-FLOOR_NEXT_TO_OFFSET_X_M = -0.15
-FLOOR_DROP_CLEARANCE_M = 0.15  # held-object bottom this far above floor at release
-
-# Top-down orientation in base_footprint (x, y, z, w)
-TOPDOWN_ORIENTATION = [1.0, 0.0, 0.0, 0.0]
-
-
-@dataclass(frozen=True)
-class _ModeConfig:
-    """All per-mode parameters in one place. Built by _mode_config()."""
-    # Parameters passed to perception MCP get_topdown_placing_pose
-    pp_top_clearance_m: float
-    pp_object_height_m: float
-    pp_x_bias_m: float
-    # When > 0 the perception MCP places at bbox.x_min + near_edge_inset_m
-    # (near-edge mode) instead of centroid + x_bias_m. Required for wide
-    # surfaces (coffee tables, desks) whose geometric centroid sits beyond
-    # the UR5e top-down reach envelope. Container mode does NOT need this
-    # because the segmented rim is roughly the centroid for narrow bins.
-    pp_near_edge_inset_m: float
-    # Post-segment behaviour
-    reach_gate_xy: float
-    post_release_lift_m: float
-    # Whether the skill must compute its own drop pose (floor) or use the
-    # perception-MCP-returned place_pose directly (container / surface).
-    overrides_drop_pose: bool
-    # Whether to run the post-release arm-cam visibility verify. Floor
-    # mode skips it because the arm cam sees BOTH the reference and the
-    # held object from above and SAM3 cannot tell which is which (plus
-    # gripper occlusion). Container and surface modes keep it.
-    run_arm_cam_verify: bool
-    # Cosmetic
-    preposition: str  # "in" / "on" / "next to"
-
-
-def _mode_config(mode: Mode, object_height_m: float) -> _ModeConfig:
-    """Return the per-mode parameters for a place call.
-
-    ``object_height_m`` is the held-object height (from the pick skill's
-    bounding-box measurement). Required for surface and floor modes;
-    ignored by container mode.
-    """
-    if mode == "container":
-        return _ModeConfig(
-            pp_top_clearance_m=0.35,
-            pp_object_height_m=0.0,        # tells perception MCP to use container math
-            pp_x_bias_m=0.08,              # compensate front-cam NEAR bias on bin
-            pp_near_edge_inset_m=0.0,      # bins are narrow; centroid + x_bias is fine
-            reach_gate_xy=CONTAINER_REACH_XY,
-            post_release_lift_m=POST_RELEASE_LIFT_M_CONTAINER,
-            overrides_drop_pose=False,
-            run_arm_cam_verify=True,
-            preposition="in",
-        )
-    if mode == "surface":
-        return _ModeConfig(
-            pp_top_clearance_m=0.05,       # 5cm above surface so the can falls clear of the gripper (matches multi_agent; was 0.03)
-            pp_object_height_m=object_height_m,
-            pp_x_bias_m=0.0,               # ignored when near_edge_inset_m > 0
-            pp_near_edge_inset_m=0.15,     # place at bbox.x_min + 0.15m (near-edge mode);
-                                           # required for wide surfaces whose geometric centroid
-                                           # lies beyond UR5e reach. 15cm keeps the drop well
-                                           # clear of the near rim.
-            reach_gate_xy=SURFACE_REACH_XY,
-            post_release_lift_m=POST_RELEASE_LIFT_M_SURFACE,
-            overrides_drop_pose=False,
-            run_arm_cam_verify=True,
-            preposition="on",
-        )
-    if mode == "floor":
-        # We segment the reference (the OTHER object on the floor), get
-        # its centroid, then compute the drop pose ourselves at floor
-        # height + lateral offset. The perception-MCP-returned place_pose
-        # would be wrong (it'd compute as if we were placing ON the
-        # reference). We still call perception MCP to get a clean
-        # centroid via surface_centroid.
-        return _ModeConfig(
-            pp_top_clearance_m=0.0,        # ignored; we override the drop pose
-            pp_object_height_m=0.0,        # use container-mode math (cheaper, returns centroid)
-            pp_x_bias_m=0.0,               # we offset ourselves
-            pp_near_edge_inset_m=0.0,      # we override the drop pose
-            reach_gate_xy=FLOOR_REACH_XY,  # wider envelope at low drop z
-            post_release_lift_m=POST_RELEASE_LIFT_M_SURFACE,
-            overrides_drop_pose=True,
-            run_arm_cam_verify=False,  # arm-cam can't distinguish held from reference
-            preposition="next to",
-        )
-    raise ValueError(f"unknown mode {mode!r}; must be one of {_VALID_MODES}")
 
 
 async def _segment(
@@ -170,231 +52,6 @@ async def _segment(
         logger.warning(f"segment_objects({camera}) error: {e}")
         return "ERROR", 1
 
-
-async def _placing_pose(
-    mcp: MCPClient,
-    target: str,
-    *,
-    cfg: _ModeConfig,
-    pointcloud_topic: str,
-) -> tuple[dict | None, int]:
-    """Call perception MCP get_topdown_placing_pose with mode params.
-
-    The returned dict always contains ``surface_centroid`` (the raw
-    segmented centroid in base_footprint) and ``place_pose`` (the
-    perception-MCP-computed wrist pose).
-
-    For container and surface modes, the caller uses ``place_pose``
-    directly. For floor mode, the caller IGNORES ``place_pose`` and
-    re-computes the drop pose locally from ``surface_centroid`` plus
-    a lateral offset (the perception MCP doesn't know about "next-to"
-    semantics).
-    """
-    try:
-        raw = await mcp.call_tool_prefixed(
-            "perception__get_topdown_placing_pose",
-            {
-                "object_name": target,
-                "pointcloud_topic": pointcloud_topic,
-                "top_clearance_m": cfg.pp_top_clearance_m,
-                "object_height_m": cfg.pp_object_height_m,
-                "x_bias_m": cfg.pp_x_bias_m,
-                "near_edge_inset_m": cfg.pp_near_edge_inset_m,
-            },
-        )
-        data = json.loads(raw) if isinstance(raw, str) else raw
-        if "place_pose" not in data and "position" not in data:
-            logger.warning(f"placing pose missing position: {data}")
-            return None, 1
-        return data, 1
-    except Exception as e:
-        logger.warning(f"get_topdown_placing_pose error: {e}")
-        return None, 1
-
-
-_ARM_JOINT_ORDER = [
-    "arm_shoulder_pan_joint",
-    "arm_shoulder_lift_joint",
-    "arm_elbow_joint",
-    "arm_wrist_1_joint",
-    "arm_wrist_2_joint",
-    "arm_wrist_3_joint",
-]
-_IK_LINE_RE = re.compile(r"^\s*([\w_]+):\s*([-+]?\d*\.?\d+)\s*rad", re.MULTILINE)
-
-
-def _parse_ik_joints(ik_raw: str) -> list[float] | None:
-    """Parse joint values from the compute_ik MCP response."""
-    if not ik_raw or "kinematics solution" not in ik_raw.lower():
-        return None
-    by_name = {name: float(val) for name, val in _IK_LINE_RE.findall(ik_raw)}
-    if not all(j in by_name for j in _ARM_JOINT_ORDER):
-        return None
-    return [by_name[j] for j in _ARM_JOINT_ORDER]
-
-
-async def _plan_to_xyz(
-    mcp: MCPClient, x: float, y: float, z: float
-) -> tuple[bool, str, int]:
-    """Plan + execute a top-down pose via the IK→joint_state pattern.
-
-    Per feedback_plan_pose_unreliable and the 2026-05-15 finding,
-    plan_and_execute(target_type="pose") is unreliable for low-z drop
-    targets: OMPL's Cartesian goal sampler returns GOAL_STATE_INVALID
-    even when compute_ik finds a valid joint solution. Routing through
-    compute_ik → plan_and_execute(target_type="joint_state") bypasses
-    the broken sampler.
-    """
-    # Step A — compute IK
-    try:
-        ik_raw = await mcp.call_tool_prefixed(
-            "moveit__compute_ik",
-            {
-                "group": "arm",
-                "position": [x, y, z],
-                "orientation": TOPDOWN_ORIENTATION,
-            },
-        )
-    except Exception as e:
-        return False, f"compute_ik error at ({x:.2f},{y:.2f},{z:.2f}): {e}", 1
-    joints = _parse_ik_joints(ik_raw)
-    if joints is None:
-        return (
-            False,
-            f"compute_ik returned no valid IK at ({x:.2f},{y:.2f},{z:.2f}): "
-            f"{ik_raw[:120] if isinstance(ik_raw, str) else ik_raw!r}",
-            1,
-        )
-
-    # Step B — clear stale collision objects BEFORE planning. perception
-    # MCP republishes target objects as collision objects after each
-    # segmentation; without a pre-plan clear the planner can find the
-    # surface / container itself as a collision blocker.
-    try:
-        await mcp.call_tool_prefixed("moveit__clear_planning_scene", {})
-    except Exception as e:
-        logger.warning(f"clear_planning_scene pre-plan error: {e}")
-
-    # Step C — plan + execute to joint_state
-    try:
-        result = await mcp.call_tool_prefixed(
-            "moveit__plan_and_execute",
-            {
-                "group": "arm",
-                "target_type": "joint_state",
-                "target": {"joint_positions": joints},
-            },
-        )
-        _low = result.lower()
-        if "execution failed" not in _low and "timed out" not in _low and ("fail" not in _low or "completed" in _low):
-            return True, result[:200], 3
-    except Exception as e:
-        return False, f"plan_and_execute(joint_state) error: {e}", 3
-
-    # Retry after re-clearing the planning scene
-    try:
-        await mcp.call_tool_prefixed("moveit__clear_planning_scene", {})
-    except Exception as e:
-        logger.warning(f"clear_planning_scene retry error: {e}")
-    try:
-        ik_raw = await mcp.call_tool_prefixed(
-            "moveit__compute_ik",
-            {
-                "group": "arm",
-                "position": [x, y, z],
-                "orientation": TOPDOWN_ORIENTATION,
-            },
-        )
-    except Exception as e:
-        return False, f"retry compute_ik error: {e}", 5
-    joints = _parse_ik_joints(ik_raw)
-    if joints is None:
-        return False, "retry compute_ik returned no valid IK", 5
-    try:
-        result = await mcp.call_tool_prefixed(
-            "moveit__plan_and_execute",
-            {
-                "group": "arm",
-                "target_type": "joint_state",
-                "target": {"joint_positions": joints},
-            },
-        )
-        _low = result.lower()
-        if "execution failed" not in _low and "timed out" not in _low and ("fail" not in _low or "completed" in _low):
-            return True, f"retry ok: {result[:200]}", 6
-        return False, f"retry failed: {result[:200]}", 6
-    except Exception as e:
-        return False, f"retry error: {e}", 6
-
-
-def _extract_xyz(data: dict) -> tuple[float, float, float]:
-    """Pull (x, y, z) out of a placing-pose response.
-
-    The perception MCP returns positions as ``{"x": ..., "y": ..., "z": ...}``
-    dicts wrapped under ``place_pose``. This helper accepts both the
-    wrapped form and a bare position dict for resilience.
-    """
-    if "place_pose" in data:
-        pose = data["place_pose"]
-        pos = pose.get("position", pose)
-    else:
-        pos = data.get("position", data)
-    if isinstance(pos, dict):
-        return float(pos["x"]), float(pos["y"]), float(pos["z"])
-    # Legacy list shape, kept for safety
-    return float(pos[0]), float(pos[1]), float(pos[2])
-
-
-async def _force_detach(mcp: MCPClient) -> int:
-    try:
-        await mcp.call_tool_prefixed(
-            "ros__publish_once",
-            {
-                "topic": "/gripper/force_detach_str",
-                "msg_type": "std_msgs/msg/String",
-                "msg": {"data": "release"},
-            },
-        )
-        return 1
-    except Exception as e:
-        logger.warning(f"force_detach error: {e}")
-        return 1
-
-
-async def _open_gripper(mcp: MCPClient) -> int:
-    await mcp.call_tool_prefixed(
-        "ros__send_action_goal",
-        {
-            "action_name": "/robotiq_gripper_controller/gripper_cmd",
-            "action_type": "control_msgs/action/GripperCommand",
-            "goal": {"command": {"position": 0.0, "max_effort": 50.0}},
-        },
-    )
-    return 1
-
-
-async def _verify_detached(
-    mcp: MCPClient, object_name: str | None, timeout: float = 4.0
-) -> tuple[bool, str, int]:
-    """Confirm /gripper/status reports detached after release."""
-    try:
-        raw = await mcp.call_tool_prefixed(
-            "ros__subscribe_once",
-            {
-                "topic": "/gripper/status",
-                "msg_type": "std_msgs/msg/String",
-                "timeout": int(timeout),
-            },
-        )
-        data = json.loads(raw) if isinstance(raw, str) else raw
-        msg = data.get("msg", data)
-        body = msg.get("data", "") if isinstance(msg, dict) else str(msg)
-        if body == "detached" or not body.startswith("attached:"):
-            return True, body or "no message (assumed detached)", 1
-        return False, body, 1
-    except Exception as e:
-        logger.warning(f"verify_detached error: {e}")
-        return True, f"verify error treated as PASS: {e}", 1
 
 
 async def _verify_object_visible_from_above(
@@ -451,6 +108,140 @@ async def _verify_object_visible_from_above(
     )
 
 
+# Container mode on the real robot. Flange this far above the rim: the held
+# object's bottom then clears the rim by ~10 cm (pads ~6 cm above its bottom).
+CONTAINER_RIM_CLEARANCE_M = 0.35
+# Reach to the bin centre from base_footprint; a drop at 0.95 m planned with the
+# elbow bent, at 1.08 m it was nearly straight.
+CONTAINER_REACH_REAL_M = 1.00
+# Footprint of the bin's collision box; keeps the arm off the rim on the way.
+CONTAINER_BOX_M = 0.40
+
+
+async def _segment_any(
+    mcp: MCPClient, prompts: list[str], cameras: tuple[str, ...]
+) -> tuple[str | None, int]:
+    """First (camera, prompt) that segments; returns (prompt, calls)."""
+    calls = 0
+    for camera in cameras:
+        for prompt in prompts:
+            status, c = await _segment(mcp, prompt, camera=camera)
+            calls += c
+            logger.info(f"{camera} SAM3 '{prompt}' -> {status}")
+            if status == "SUCCESS":
+                return prompt, calls
+    return None, calls
+
+
+async def _run_container(mcp: MCPClient, target_location: str, object_name: str) -> dict:
+    """Drop the held object into a container in front of the robot.
+
+    The bin's centre comes from the grasp tool's near-face rule on the bin
+    cloud (the placing tool's point mean is pulled metres away by stray depth
+    points on a dark bin); its rim from the highest bin points. The bin goes
+    into the planning scene, the flange goes straight to rim + clearance, the
+    gripper opens and the arm camera checks the object from above.
+    """
+    tool_calls = 0
+    base = {"target_location": target_location}
+
+    def fail(reason: str) -> dict:
+        return {**base, "success": False, "reason": reason, "tool_calls_used": tool_calls}
+
+    logger.info(f"place -> container '{target_location}' object='{object_name}'")
+
+    finger = await gripper_position(mcp)
+    tool_calls += 1
+    if finger is None or not HOLD_MIN <= finger <= HOLD_MAX:
+        return fail(f"nothing held (finger_joint {finger}): pick first")
+
+    arm = await move_arm_to_look_forward(mcp)
+    tool_calls += 1
+    if not arm.get("success"):
+        return fail(f"arm reset failed: {arm.get('reason')}")
+    tool_calls += 2
+    try:
+        await reset_scene(mcp)
+    except Exception as e:
+        return fail(f"planning scene reset failed, no floor in the scene: {e}")
+
+    prompt, calls = await _segment_any(
+        mcp, geometric_fallback_prompts(target_location), ("arm", "front")
+    )
+    tool_calls += calls
+    if prompt is None:
+        return fail(f"'{target_location}' not segmented on either camera")
+
+    try:
+        raw = await mcp.call_tool_prefixed(
+            "perception__get_topdown_grasp_pose", {"object_name": prompt}
+        )
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        cx = float(data["grasp_pose"]["position"]["x"])
+        cy = float(data["grasp_pose"]["position"]["y"])
+        rim = float(data["bbox_base_frame"]["z_max"])
+    except Exception as e:
+        return fail(f"no container pose from the segmented cloud: {e}")
+    tool_calls += 1
+    drop_z = rim + CONTAINER_RIM_CLEARANCE_M
+    dist = (cx ** 2 + cy ** 2) ** 0.5
+    logger.info(f"container centre=({cx:.3f},{cy:.3f}) rim={rim:.3f} drop_z={drop_z:.3f} dist={dist:.2f}")
+    if dist > CONTAINER_REACH_REAL_M:
+        return fail(
+            f"container at {dist:.2f} m > {CONTAINER_REACH_REAL_M:.2f} m. "
+            "Navigator must redeliver closer."
+        )
+
+    try:
+        reply = await mcp.call_tool_prefixed(
+            "moveit__add_collision_box",
+            {
+                "object_id": "container",
+                "position": [cx, cy, rim / 2],
+                "dimensions": [CONTAINER_BOX_M, CONTAINER_BOX_M, rim],
+                "frame_id": "base_footprint",
+            },
+        )
+        if not str(reply).startswith("Successfully"):
+            raise RuntimeError(str(reply)[:200])
+    except Exception as e:
+        await move_arm_to_look_forward(mcp)
+        return fail(f"container collision box not added: {e}")
+    tool_calls += 1
+
+    ok, info, calls = await plan_to_xyz(mcp, cx, cy, drop_z, _TOPDOWN, reset_on_retry=False)
+    tool_calls += calls
+    if not ok:
+        await move_arm_to_look_forward(mcp)
+        tool_calls += 1
+        return fail(f"drop pose plan failed: {info}")
+
+    try:
+        opened = await gripper_command(mcp, GRIPPER_OPEN)
+    except Exception as e:
+        return fail(f"open_gripper error: {e} (arm above the container, object maybe still held)")
+    tool_calls += 1
+    if not opened["position"] <= HOLD_MIN:  # also fails on a missing position (NaN)
+        return fail(f"gripper did not open (position {opened['position']:.3f}); arm above the container")
+
+    visible, vinfo, calls = await _verify_object_visible_from_above(mcp, object_name)
+    tool_calls += calls
+    logger.info(f"arm-cam verify -> {vinfo}")
+
+    arm = await move_arm_to_look_forward(mcp)
+    tool_calls += 1
+    if not arm.get("success"):
+        logger.warning(f"post-release look_forward failed: {arm.get('reason')}")
+    if not visible:
+        return fail(f"placement verify failed: {vinfo}")
+    return {
+        **base,
+        "success": True,
+        "reason": f"dropped into {target_location} at ({cx:.2f},{cy:.2f},{drop_z:.2f}); {vinfo}",
+        "tool_calls_used": tool_calls,
+    }
+
+
 async def run(
     mcp: MCPClient,
     target_location: str,
@@ -488,296 +279,12 @@ async def run(
         raise ValueError("object_name must be a non-empty string")
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
-    if mode in ("surface", "floor") and object_height_m <= 0:
-        raise ValueError(
-            f"object_height_m must be > 0 for mode={mode!r} "
-            f"(use pick's held_object_height_m); got {object_height_m}"
-        )
-
-    tool_calls = 0
-    base_result = {"target_location": target_location}
-    cfg = _mode_config(mode, object_height_m)
-    logger.info(
-        f"place -> target='{target_location}' object='{object_name}' "
-        f"mode={mode} obj_h={object_height_m:.2f}m"
-    )
-
-    # Step 1 — arm to look_forward (transit / sensing pose)
-    arm = await move_arm_to_look_forward(mcp)
-    tool_calls += 1
-    if not arm.get("success"):
-        return {
-            **base_result,
-            "success": False,
-            "reason": f"arm reset failed: {arm.get('reason')}",
-            "tool_calls_used": tool_calls,
-        }
-
-    # Step 2 — clear octomap (defensive; sensors:[] disables the in-process
-    # octomap_updater, but keep this in case sensors are re-enabled later)
-    try:
-        await mcp.call_tool_prefixed(
-            "ros__call_service",
-            {
-                "service_name": "/clear_octomap",
-                "service_type": "std_srvs/srv/Empty",
-                "request": {},
-            },
-        )
-        tool_calls += 1
-    except Exception as e:
-        logger.warning(f"clear_octomap error: {e}")
-        tool_calls += 1
-
-    # Step 2b — clear stale collision objects from prior pick/place runs.
-    # Open3D drop-pose and similar perception code can publish collision
-    # objects that persist across attempts and block the descent.
-    try:
-        await mcp.call_tool_prefixed("moveit__clear_planning_scene", {})
-        tool_calls += 1
-    except Exception as e:
-        logger.warning(f"clear_planning_scene error: {e}")
-        tool_calls += 1
-
-    # Pre-segment settle: navigator's approach may have just driven the
-    # base; the front-cam ring buffer can hold up to ~100ms of stale
-    # frames. Wait for the base to be still + an extra beat to flush.
-    await wait_until_still(mcp, timeout=3.0, post_settle=0.5)
-
-    # Step 3a — segmentation with shared fallback chain. Try the FRONT
-    # camera first (its wider FOV usually catches surfaces and tall
-    # containers cleanly). If every front-cam prompt misses, fall back
-    # to the ARM camera at look_forward — the held object blocks the
-    # centre of the frame but the target's upper portion is usually
-    # visible above the gripper.
-    fallbacks = geometric_fallback_prompts(target_location)
-    seg_ok = False
-    seg_camera = "front"
-    last_status = "ERROR"
-    for prompt in fallbacks:
-        last_status, calls = await _segment(mcp, prompt, camera="front")
-        tool_calls += calls
-        logger.info(f"front SAM3 '{prompt}' -> {last_status}")
-        if last_status == "SUCCESS":
-            seg_ok = True
-            break
-    if not seg_ok:
-        for prompt in fallbacks:
-            last_status, calls = await _segment(mcp, prompt, camera="arm")
-            tool_calls += calls
-            logger.info(f"arm SAM3 '{prompt}' -> {last_status}")
-            if last_status == "SUCCESS":
-                seg_ok = True
-                seg_camera = "arm"
-                break
-    floor_fixed_fallback = False
-    if not seg_ok:
-        if mode == "floor":
-            # Floor fallback: if the reference object cannot be segmented on
-            # either camera, drop the held object at a fixed pose directly in
-            # front of the robot rather than hard-failing (mirrors the fixed
-            # forward floor drop in multi_agent). Demo-prep robustness; out of
-            # the frozen evaluation matrix.
-            floor_fixed_fallback = True
-            logger.warning(
-                f"floor mode: reference '{target_location}' not segmentable on "
-                f"either camera; falling back to a fixed forward floor drop"
-            )
-        else:
-            return {
-                **base_result,
-                "success": False,
-                "reason": (
-                    f"both-camera segmentation failed for '{target_location}' "
-                    f"and fallbacks {fallbacks[1:]}"
-                ),
-                "tool_calls_used": tool_calls,
-            }
-
-    # Step 3b — coarse placing pose from whichever camera anchored.
-    # Skipped in the floor fixed-fallback path (no reference was segmented).
-    coarse = None
-    if not floor_fixed_fallback:
-        pc_topic = (
-            "/front/segmented_pointcloud" if seg_camera == "front"
-            else "/segmented_pointcloud"
-        )
-        coarse, calls = await _placing_pose(
-            mcp,
-            target_location,
-            cfg=cfg,
-            pointcloud_topic=pc_topic,
-        )
-        tool_calls += calls
-        if coarse is None:
-            return {
-                **base_result,
-                "success": False,
-                "reason": "placing pose computation failed",
-                "tool_calls_used": tool_calls,
-            }
-
-    # Drop pose dispatch:
-    #   - container / surface: use perception MCP's place_pose directly.
-    #   - floor:               override with reference_centroid + lateral
-    #                          offset; z = floor + finger + held_h +
-    #                          clearance (placing NEXT TO reference, not ON).
-    if floor_fixed_fallback:
-        # Fixed forward floor drop (reference not segmented): directly in
-        # front of the robot, within the UR5e low-z reach envelope.
-        cx = 0.40
-        cy = 0.0
-        cz = 0.0 + 0.14 + object_height_m + FLOOR_DROP_CLEARANCE_M
-        logger.info(
-            f"floor FIXED-fallback pose=({cx:.2f},{cy:.2f},{cz:.2f}) "
-            f"(reference not found, dropping in front)"
-        )
-    elif cfg.overrides_drop_pose:  # floor mode with a segmented reference
-        ref = coarse.get("surface_centroid", {})
-        try:
-            ref_x = float(ref["x"])
-            ref_y = float(ref["y"])
-        except (KeyError, TypeError, ValueError) as e:
-            return {
-                **base_result,
-                "success": False,
-                "reason": f"floor mode: surface_centroid missing/malformed: {e}",
-                "tool_calls_used": tool_calls,
-            }
-        cx = ref_x + FLOOR_NEXT_TO_OFFSET_X_M  # negative → towards robot
-        cy = ref_y
-        cz = 0.0 + 0.14 + object_height_m + FLOOR_DROP_CLEARANCE_M
-        logger.info(
-            f"floor pose=({cx:.2f},{cy:.2f},{cz:.2f}) "
-            f"[ref=({ref_x:.2f},{ref_y:.2f}), offset_x={FLOOR_NEXT_TO_OFFSET_X_M}]"
-        )
-    else:
-        cx, cy, cz = _extract_xyz(coarse)
-        logger.info(f"pose=({cx:.2f},{cy:.2f},{cz:.2f})")
-
-    # Step 4 — reach check (per-mode gate from cfg).
-    dist = (cx ** 2 + cy ** 2) ** 0.5
-    if dist > cfg.reach_gate_xy:
-        return {
-            **base_result,
-            "success": False,
-            "reason": (
-                f"xy distance {dist:.2f}m > {cfg.reach_gate_xy:.2f}m "
-                f"({mode} gate). Navigator must redeliver closer."
-            ),
-            "tool_calls_used": tool_calls,
-        }
-
-    place_x, place_y, place_z = cx, cy, cz
-
-    # Step 7 — pre-place above target
-    ok, info, calls = await _plan_to_xyz(
-        mcp, place_x, place_y, place_z + PRE_PLACE_CLEARANCE_M
-    )
-    tool_calls += calls
-    if not ok:
-        return {
-            **base_result,
-            "success": False,
-            "reason": f"pre-place plan failed: {info}",
-            "tool_calls_used": tool_calls,
-        }
-
-    # Step 8 — descend straight down to drop pose
-    ok, info, calls = await _plan_to_xyz(mcp, place_x, place_y, place_z)
-    tool_calls += calls
-    if not ok:
-        return {
-            **base_result,
-            "success": False,
-            "reason": f"descent plan failed: {info}",
-            "tool_calls_used": tool_calls,
-        }
-
-    # Step 9 — force-detach + open gripper
-    tool_calls += await _force_detach(mcp)
-    await asyncio.sleep(0.5)
-    try:
-        tool_calls += await _open_gripper(mcp)
-    except Exception as e:
-        logger.warning(f"open_gripper error: {e}")
-        tool_calls += 1
-
-    # Wait for fingers to physically open + gripper_attach_node to settle.
-    # The GripperCommand action's `reached_goal` only confirms the
-    # command was accepted, not that the fingers have moved through the
-    # attach_node closure threshold (finger_joint < 0.10). Without this
-    # sleep the lift trajectory starts while fingers are still partially
-    # closed near the just-released object, the attach_node sees
-    # finger_joint ≥ 0.10 + proximity and re-fires on the object,
-    # causing trajectory state divergence and a stuck arm.
-    # 2026-05-16: validated empirically — 0.5 s of the prior settle was
-    # not enough; 1.8 s reliably clears the threshold.
-    await asyncio.sleep(1.8)
-
-    # Step 10 — verify gripper detached
-    detached, body, calls = await _verify_detached(mcp, object_name)
-    tool_calls += calls
-    if not detached:
-        return {
-            **base_result,
-            "success": False,
-            "reason": f"gripper still {body} after release",
-            "tool_calls_used": tool_calls,
-        }
-    logger.info(f"gripper status -> {body}")
-
-    # Step 11 — lift clear before verify (arm cam needs to be above the
-    # drop pose with EE in top-down orientation so the camera points
-    # straight down at the drop point). Lift height from cfg: surface
-    # and floor get +0.20 m for cleaner separation from the released
-    # object (avoids gripper_attach_node re-fire); container stays at
-    # +0.10 m because the bin drop pose is at the UR5e reach edge.
-    ok, info, calls = await _plan_to_xyz(
-        mcp, place_x, place_y, place_z + cfg.post_release_lift_m
-    )
-    tool_calls += calls
-    if not ok:
-        logger.warning(f"lift-clear plan failed: {info}; continuing")
-
-    # Step 12 — placement verify via arm camera looking down at drop pose.
-    # Runs for container + surface modes (per cfg.run_arm_cam_verify).
-    # Floor mode SKIPS verify because the arm cam from above sees BOTH
-    # the held object AND the reference object near each other, and
-    # SAM3 cannot reliably distinguish them; detach status is the gate
-    # for floor mode.
-    visible_ok = True
-    vinfo = "skipped (floor mode; detach status is the gate)"
-    if cfg.run_arm_cam_verify:
-        visible_ok, vinfo, calls = await _verify_object_visible_from_above(
-            mcp, object_name
-        )
-        tool_calls += calls
-        logger.info(f"arm-cam verify -> {vinfo}")
-
-    # Step 13 — return to look_forward (transit posture). Run regardless
-    # of the verify result so the arm is left in a transit-ready pose.
-    arm_back = await move_arm_to_look_forward(mcp)
-    tool_calls += 1
-    if not arm_back.get("success"):
-        logger.warning(
-            f"post-release look_forward failed: {arm_back.get('reason')}"
-        )
-
-    if not visible_ok:
-        return {
-            **base_result,
-            "success": False,
-            "reason": f"placement verify failed: {vinfo}",
-            "tool_calls_used": tool_calls,
-        }
-
+    if mode == "container":
+        return await _run_container(mcp, target_location, object_name)
+    # surface and floor still use the simulation's release checks
     return {
-        **base_result,
-        "success": True,
-        "reason": (
-            f"placed {cfg.preposition} {target_location} at "
-            f"({place_x:.2f},{place_y:.2f},{place_z:.2f}); {vinfo}"
-        ),
-        "tool_calls_used": tool_calls,
+        "target_location": target_location,
+        "success": False,
+        "reason": f"mode={mode!r} is not adapted to the real robot yet (only 'container')",
+        "tool_calls_used": 0,
     }
