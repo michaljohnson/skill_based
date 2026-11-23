@@ -6,11 +6,11 @@ The planner picks the mode with the ``mode`` argument:
              the held object falls in.
   surface    put ON a table or box: the object's bottom ends a few cm above
              the segmented top, then the gripper opens.
-  floor      put NEXT TO an object on the floor.  Not adapted yet.
+  floor      put NEXT TO a reference object on the floor, between it and the
+             robot; the floor height is known (z = 0), so the object is set down.
 
-Surface needs the held object's height, which pick returns as
-``held_object_height_m``; container mode ignores it. Floor's simulation
-version is in git history (branch ``summit``) as a template.
+Surface and floor need the held object's height, which pick returns as
+``held_object_height_m``; container mode ignores it.
 """
 
 import asyncio
@@ -97,13 +97,13 @@ async def _verify_object_visible_from_above(
         if status == "SUCCESS":
             return (
                 True,
-                f"'{object_name}' visible on arm camera at drop pose "
+                f"'{object_name}' visible on arm camera above the drop point "
                 f"(settled, attempt {attempt+1})",
                 calls,
             )
     return (
         False,
-        f"'{object_name}' NOT visible on arm camera at drop pose after "
+        f"'{object_name}' NOT visible on arm camera above the drop point after "
         f"settle+retry (seg status: {status}) — likely missed target / fell elsewhere",
         calls,
     )
@@ -120,8 +120,8 @@ CONTAINER_BOX_M = 0.40
 
 # Surface mode. Flange to the middle of the finger pads (perception's GRIPPER_FINGER_OFFSET_M).
 PAD_OFFSET_M = 0.188
-# Object bottom this far above the top when the gripper opens. The top is the highest point
-# of the cloud, which depth noise puts ~1 cm above the real surface. Pick measures how far
+# Object bottom this far above the top when the gripper opens. The top is perception's top_z
+# (99th percentile of the heights; without it the highest point, often cm high). Pick measures how far
 # the pads sit above the object's bottom; without that the object is counted as hanging
 # fully below the pads, with more clearance.
 SURFACE_CLEARANCE_M = 0.005
@@ -133,6 +133,16 @@ SURFACE_TOP_MIN_M = 0.05
 SURFACE_TOP_MAX_M = 0.80
 # A surface whose middle is out of reach gets the object this far behind its near edge.
 SURFACE_EDGE_INSET_M = 0.15
+
+# Floor mode: the object goes this far in front of the reference's near face, towards the
+# robot (never behind it, where the arm would reach over the reference): the open 2F-140
+# fingers spread ~7 cm to each side, plus half a small object and a margin.
+FLOOR_GAP_M = 0.13
+# Closer than this the arm would have to reach in front of its own base.
+FLOOR_REACH_MIN_M = 0.50
+# Surface and floor: straight up this far after the release, so the open fingers clear the
+# object and the arm camera is far enough above it to segment it (at the drop pose it is too close).
+VERIFY_LIFT_M = 0.20
 
 
 async def _segment_any(
@@ -158,12 +168,12 @@ async def _run_drop(
     object_height_m: float,
     pads_above_bottom_m: float | None = None,
 ) -> dict:
-    """Release the held object into a container or onto a surface in front of the robot.
+    """Release the held object into a container, onto a surface or onto the floor.
 
-    Both modes segment the target, measure it with the grasp tool (near-face
-    centre, top from the highest points), add it to the planning scene, move the
-    flange straight to the drop point, open the gripper and check the object
-    from above with the arm camera. They differ only in the drop point and the box.
+    Every mode segments the target, measures it with the grasp tool (near-face
+    centre, top from the highest points), adds it to the planning scene, moves
+    the flange to the drop point, opens the gripper and checks the object from
+    above with the arm camera. They differ only in the drop point and the box.
     """
     tool_calls = 0
     base = {"target_location": target_location}
@@ -172,8 +182,8 @@ async def _run_drop(
         return {**base, "success": False, "reason": reason, "tool_calls_used": tool_calls}
 
     logger.info(f"place -> {mode} '{target_location}' object='{object_name}' obj_h={object_height_m:.3f}")
-    if mode == "surface" and not object_height_m > 0:
-        return fail("surface mode needs the held object's height: pass pick's held_object_height_m")
+    if mode in ("surface", "floor") and not object_height_m > 0:
+        return fail(f"{mode} mode needs the held object's height: pass pick's held_object_height_m")
 
     finger = await gripper_position(mcp)
     tool_calls += 1
@@ -205,16 +215,37 @@ async def _run_drop(
         cx = float(data["grasp_pose"]["position"]["x"])
         cy = float(data["grasp_pose"]["position"]["y"])
         top = float(data["bbox_base_frame"]["z_max"])
-        if mode == "surface":
+        if mode == "surface" and data.get("top_z") is not None:
+            # perception's robust top (99th percentile); z_max is one point, often cm high.
+            # Container and floor keep z_max: a thin rim or a box that is only an obstacle.
+            top = float(data["top_z"])
+        if mode in ("surface", "floor"):
             bbox = {k: float(data["bbox_base_frame"][k]) for k in ("x_min", "x_max", "y_min", "y_max")}
     except Exception as e:
         return fail(f"no {mode} pose from the segmented cloud: {e}")
     tool_calls += 1
 
+    def set_down_z(support: float) -> float:
+        """Flange z that puts the held object's bottom just above ``support``."""
+        if pads_above_bottom_m is not None and 0 < pads_above_bottom_m <= object_height_m:
+            return support + SURFACE_CLEARANCE_M + pads_above_bottom_m + PAD_OFFSET_M
+        return support + SURFACE_CLEARANCE_UNMEASURED_M + object_height_m + PAD_OFFSET_M
+
     if mode == "container":
         drop_z = top + CONTAINER_RIM_CLEARANCE_M
         box_pos = [cx, cy, top / 2]
         box_dim = [CONTAINER_BOX_M, CONTAINER_BOX_M, top]
+    elif mode == "floor":
+        ref = (cx ** 2 + cy ** 2) ** 0.5
+        # Near face: the reference's bbox point closest to the robot.
+        near = (bbox["x_min"] ** 2 + min(max(0.0, bbox["y_min"]), bbox["y_max"]) ** 2) ** 0.5
+        offset = max(0.0, ref - near) + FLOOR_GAP_M
+        if ref <= offset:
+            return fail(f"reference at {ref:.2f} m is too close to put anything in front of it")
+        cx, cy = cx * (1 - offset / ref), cy * (1 - offset / ref)
+        drop_z = set_down_z(0.0)
+        box_pos = [(bbox["x_min"] + bbox["x_max"]) / 2, (bbox["y_min"] + bbox["y_max"]) / 2, top / 2]
+        box_dim = [bbox["x_max"] - bbox["x_min"], bbox["y_max"] - bbox["y_min"], top]
     else:
         if not SURFACE_TOP_MIN_M <= top <= SURFACE_TOP_MAX_M:
             return fail(
@@ -223,10 +254,7 @@ async def _run_drop(
             )
         if (cx ** 2 + cy ** 2) ** 0.5 > CONTAINER_REACH_REAL_M:
             cx = min(cx, bbox["x_min"] + SURFACE_EDGE_INSET_M)
-        if pads_above_bottom_m is not None and 0 < pads_above_bottom_m <= object_height_m:
-            drop_z = top + SURFACE_CLEARANCE_M + pads_above_bottom_m + PAD_OFFSET_M
-        else:
-            drop_z = top + SURFACE_CLEARANCE_UNMEASURED_M + object_height_m + PAD_OFFSET_M
+        drop_z = set_down_z(top)
         box_pos = [(bbox["x_min"] + bbox["x_max"]) / 2, (bbox["y_min"] + bbox["y_max"]) / 2, top / 2]
         box_dim = [bbox["x_max"] - bbox["x_min"], bbox["y_max"] - bbox["y_min"], top]
 
@@ -237,20 +265,23 @@ async def _run_drop(
             f"{mode} at {dist:.2f} m > {CONTAINER_REACH_REAL_M:.2f} m. "
             "Navigator must redeliver closer."
         )
+    if mode == "floor" and dist < FLOOR_REACH_MIN_M:
+        return fail(f"floor drop at {dist:.2f} m < {FLOOR_REACH_MIN_M:.2f} m: too close to the robot. Back up.")
 
+    box_id = "reference" if mode == "floor" else mode  # "floor" is the planning scene's floor box
     try:
         reply = await mcp.call_tool_prefixed(
             "moveit__add_collision_box",
-            {"object_id": mode, "position": box_pos, "dimensions": box_dim, "frame_id": "base_footprint"},
+            {"object_id": box_id, "position": box_pos, "dimensions": box_dim, "frame_id": "base_footprint"},
         )
         if not str(reply).startswith("Successfully"):
             raise RuntimeError(str(reply)[:200])
     except Exception as e:
         await move_arm_to_look_forward(mcp)
-        return fail(f"{mode} collision box not added: {e}")
+        return fail(f"{box_id} collision box not added: {e}")
     tool_calls += 1
 
-    stops = [drop_z + SURFACE_APPROACH_M, drop_z] if mode == "surface" else [drop_z]
+    stops = [drop_z] if mode == "container" else [drop_z + SURFACE_APPROACH_M, drop_z]
     for z in stops:
         ok, info, calls = await plan_to_xyz(mcp, cx, cy, z, _TOPDOWN, reset_on_retry=False)
         tool_calls += calls
@@ -267,6 +298,12 @@ async def _run_drop(
     if not opened["position"] <= HOLD_MIN:  # also fails on a missing position (NaN)
         return fail(f"gripper did not open (position {opened['position']:.3f}); arm above the {mode}")
 
+    if mode != "container":
+        ok, info, calls = await plan_to_xyz(mcp, cx, cy, drop_z + VERIFY_LIFT_M, _TOPDOWN, reset_on_retry=False)
+        tool_calls += calls
+        if not ok:
+            logger.warning(f"lift after release failed: {info}; verifying from the drop pose")
+
     visible, vinfo, calls = await _verify_object_visible_from_above(mcp, object_name)
     tool_calls += calls
     logger.info(f"arm-cam verify -> {vinfo}")
@@ -277,11 +314,11 @@ async def _run_drop(
         logger.warning(f"post-release look_forward failed: {arm.get('reason')}")
     if not visible:
         return fail(f"placement verify failed: {vinfo}")
-    where = "into" if mode == "container" else "onto"
+    where = {"container": "into", "surface": "onto", "floor": "next to"}[mode]
     return {
         **base,
         "success": True,
-        "reason": f"dropped {where} {target_location} at ({cx:.2f},{cy:.2f},{drop_z:.2f}); {vinfo}",
+        "reason": f"placed {where} {target_location} at ({cx:.2f},{cy:.2f},{drop_z:.2f}); {vinfo}",
         "tool_calls_used": tool_calls,
     }
 
@@ -328,11 +365,4 @@ async def run(
         raise ValueError("object_name must be a non-empty string")
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
-    if mode in ("container", "surface"):
-        return await _run_drop(mcp, target_location, object_name, mode, object_height_m, pads_above_bottom_m)
-    return {
-        "target_location": target_location,
-        "success": False,
-        "reason": f"mode={mode!r} is not adapted to the real robot yet (container and surface are)",
-        "tool_calls_used": 0,
-    }
+    return await _run_drop(mcp, target_location, object_name, mode, object_height_m, pads_above_bottom_m)

@@ -80,8 +80,21 @@ def _box(mcp):
     return next(a for n, a in mcp.calls if n == "moveit__add_collision_box" and a["object_id"] != "floor")
 
 
+def _is_open(name, args):
+    return name == "ros__send_action_goal" and args["goal"]["command"]["position"] == 0.0
+
+
+def _release_index(mcp):
+    return next((i for i, (n, a) in enumerate(mcp.calls) if _is_open(n, a)), len(mcp.calls))
+
+
 def _drop_heights(mcp):
-    return [a["position"][2] for n, a in mcp.calls if n == "moveit__compute_ik"]
+    """IK heights up to the release (the lift after it is not part of the drop)."""
+    return [a["position"][2] for n, a in mcp.calls[:_release_index(mcp)] if n == "moveit__compute_ik"]
+
+
+def _after_release(mcp):
+    return mcp.calls[_release_index(mcp) + 1:]
 
 
 def test_container_drop_succeeds_above_the_rim():
@@ -132,11 +145,86 @@ def test_bin_falls_back_to_the_front_camera():
     assert result["success"], result["reason"]
 
 
-def test_floor_refused_on_the_real_robot():
-    mcp = FakeMCP()
-    result = _run(mcp, "floor")
+# The orange cylinder as the reference on the floor, 1.05 m straight ahead.
+CYLINDER = {
+    "grasp_pose": {
+        "frame_id": "base_footprint",
+        "position": {"x": 1.05, "y": 0.0, "z": 0.30},
+        "orientation": {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0},
+    },
+    "bbox_base_frame": {"x_min": 1.01, "x_max": 1.09, "y_min": -0.04, "y_max": 0.04, "z_min": 0.0, "z_max": 0.12},
+}
+
+
+def _ik_points(mcp):
+    return [tuple(a["position"]) for n, a in mcp.calls if n == "moveit__compute_ik"]
+
+
+def _ref_at(x, y, half=0.04):
+    pose = json.loads(json.dumps(CYLINDER))
+    pose["grasp_pose"]["position"].update({"x": x, "y": y})
+    pose["bbox_base_frame"].update({"x_min": x - half, "x_max": x + half, "y_min": y - half, "y_max": y + half})
+    return pose
+
+
+def test_floor_sets_the_object_down_in_front_of_the_reference():
+    mcp = FakeMCP(bin_pose=CYLINDER)
+    result = _run(mcp, "floor", height=0.066, pads=0.048)
+    assert result["success"], result["reason"]
+    assert "next to" in result["reason"]
+    final = 0.0 + 0.005 + 0.048 + 0.188
+    assert _drop_heights(mcp) == pytest.approx([final + 0.08, final])
+    x, y, _ = _ik_points(mcp)[-1]
+    # Near face at x_min 1.01: 13 cm in front of it.
+    assert (x, y) == pytest.approx((1.01 - 0.13, 0.0))
+
+
+def test_floor_offset_points_back_towards_the_robot():
+    mcp = FakeMCP(bin_pose=_ref_at(0.9, 0.3))
+    _run(mcp, "floor", height=0.066, pads=0.048)
+    x, y, _ = _ik_points(mcp)[-1]
+    ref = (0.9 ** 2 + 0.3 ** 2) ** 0.5
+    assert y / x == pytest.approx(0.3 / 0.9)
+    assert ref - (x ** 2 + y ** 2) ** 0.5 > 0.13
+
+
+def test_floor_next_to_a_big_box_stays_clear_of_its_front():
+    mcp = FakeMCP(bin_pose=_ref_at(1.0, 0.0, half=0.15))
+    result = _run(mcp, "floor", height=0.066, pads=0.048)
+    assert result["success"], result["reason"]
+    x, _, _ = _ik_points(mcp)[-1]
+    assert x == pytest.approx(0.85 - 0.13)
+
+
+def test_floor_reference_goes_into_the_scene():
+    mcp = FakeMCP(bin_pose=CYLINDER)
+    _run(mcp, "floor", height=0.066, pads=0.048)
+    box = _box(mcp)
+    assert box["object_id"] == "reference"
+    assert box["position"] == pytest.approx([1.05, 0.0, 0.06])
+    assert box["dimensions"] == pytest.approx([0.08, 0.08, 0.12])
+
+
+@pytest.mark.parametrize("ref_x", [0.62, 1.25])
+def test_floor_drop_outside_the_reach_band_stops_before_motion(ref_x):
+    mcp = FakeMCP(bin_pose=_ref_at(ref_x, 0.0))
+    result = _run(mcp, "floor", height=0.066, pads=0.048)
     assert not result["success"]
-    assert "not adapted" in result["reason"]
+    assert "moveit__compute_ik" not in mcp.names()
+
+
+def test_floor_mode_keeps_the_scene_floor_box():
+    mcp = FakeMCP(bin_pose=CYLINDER)
+    _run(mcp, "floor", height=0.066, pads=0.048)
+    floor_boxes = [a for n, a in mcp.calls if n == "moveit__add_collision_box" and a["object_id"] == "floor"]
+    assert len(floor_boxes) == 1  # only the one reset_scene adds
+
+
+def test_floor_without_a_height_stops_before_any_motion():
+    mcp = FakeMCP(bin_pose=CYLINDER)
+    result = _run(mcp, "floor", height=0.0)
+    assert not result["success"]
+    assert "held_object_height_m" in result["reason"]
     assert mcp.calls == []
 
 
@@ -285,3 +373,71 @@ def test_unreadable_open_result_is_a_failure():
     result = _run(mcp)
     assert not result["success"]
     assert "did not open" in result["reason"]
+
+
+@pytest.mark.parametrize("mode,pose", [("floor", CYLINDER), ("surface", BOX)])
+def test_arm_lifts_straight_up_before_the_verify(mode, pose):
+    mcp = FakeMCP(bin_pose=pose)
+    result = _run(mcp, mode, height=0.066, pads=0.048)
+    assert result["success"], result["reason"]
+    drop = _ik_points(mcp)[len(_drop_heights(mcp)) - 1]
+    after = _after_release(mcp)
+    lift = next(a for n, a in after if n == "moveit__compute_ik")["position"]
+    assert lift == pytest.approx([drop[0], drop[1], drop[2] + place.VERIFY_LIFT_M])
+    names = [n for n, _ in after]
+    assert names.index("moveit__compute_ik") < names.index("perception__segment_objects")
+
+
+def test_container_verifies_without_a_lift():
+    mcp = FakeMCP()
+    result = _run(mcp)
+    assert result["success"], result["reason"]
+    names = [n for n, _ in _after_release(mcp)]
+    assert "moveit__compute_ik" not in names[:names.index("perception__segment_objects")]
+
+
+def test_failed_lift_still_verifies():
+    mcp = FakeMCP(bin_pose=CYLINDER)
+    real = mcp.call_tool_prefixed
+
+    async def refuse_lift(name, args):
+        if name == "moveit__plan_and_execute" and any(_is_open(n, a) for n, a in mcp.calls):
+            mcp.calls.append((name, args))
+            return REFUSED
+        return await real(name, args)
+
+    mcp.call_tool_prefixed = refuse_lift
+    result = _run(mcp, "floor", height=0.066, pads=0.048)
+    assert result["success"], result["reason"]
+    assert "perception__segment_objects" in [n for n, _ in _after_release(mcp)]
+
+
+def test_surface_uses_the_robust_top_when_perception_has_it():
+    box = json.loads(json.dumps(BOX))
+    box["bbox_base_frame"]["z_max"] = 0.35  # a stray point 5 cm above the lid
+    box["top_z"] = 0.30
+    mcp = FakeMCP(bin_pose=box)
+    result = _run(mcp, "surface", height=0.066, pads=0.048)
+    assert result["success"], result["reason"]
+    assert _drop_heights(mcp)[-1] == pytest.approx(0.30 + 0.005 + 0.048 + 0.188)
+    assert _box(mcp)["dimensions"][2] == pytest.approx(0.30)
+
+
+def test_container_keeps_the_highest_point_as_its_rim():
+    rim = json.loads(json.dumps(BIN))
+    rim["top_z"] = 0.40
+    mcp = FakeMCP(bin_pose=rim)
+    _run(mcp)
+    assert _drop_heights(mcp)[0] == pytest.approx(0.45 + place.CONTAINER_RIM_CLEARANCE_M)
+
+
+@pytest.mark.parametrize("x,y,half", [(0.9, 0.3, 0.04), (0.95, -0.35, 0.12), (1.0, 0.0, 0.15), (0.85, 0.5, 0.08)])
+def test_floor_drop_keeps_the_gap_to_the_whole_reference_footprint(x, y, half):
+    mcp = FakeMCP(bin_pose=_ref_at(x, y, half))
+    result = _run(mcp, "floor", height=0.066, pads=0.048)
+    assert result["success"], result["reason"]
+    dx, dy, _ = _ik_points(mcp)[len(_drop_heights(mcp)) - 1]
+    # Nearest point of the reference's footprint rectangle to the drop point.
+    nx = min(max(dx, x - half), x + half)
+    ny = min(max(dy, y - half), y + half)
+    assert ((dx - nx) ** 2 + (dy - ny) ** 2) ** 0.5 >= place.FLOOR_GAP_M - 1e-9
