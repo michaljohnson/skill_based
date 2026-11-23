@@ -174,6 +174,14 @@ PLANNER_TOOLS = [
                             "Container mode ignores it (pass 0.0 if unknown)."
                         ),
                     },
+                    "pads_above_bottom_m": {
+                        "type": "number",
+                        "description": (
+                            "From the PRIOR pick call's `pads_above_bottom_m` result "
+                            "field. Optional; lets surface mode set the object down "
+                            "gently instead of dropping it."
+                        ),
+                    },
                 },
                 "required": ["target_location", "object_name", "mode", "object_height_m"],
             },
@@ -205,6 +213,9 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
             object_name=args["object_name"],
             mode=args["mode"],
             object_height_m=float(args["object_height_m"]),
+            pads_above_bottom_m=(
+                float(args["pads_above_bottom_m"]) if args.get("pads_above_bottom_m") is not None else None
+            ),
         )
     return {"success": False, "reason": f"unknown skill: {name}"}
 
