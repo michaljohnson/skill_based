@@ -130,7 +130,7 @@ def test_missing_object_fails_without_driving():
     world = FakeWorld(name="green cube")
     result = asyncio.run(approach.run(world, "red ball", "pick"))
     assert not result["success"]
-    assert "not found" in result["reason"]
+    assert result["failure"] == "not_found"
     assert "nav2__drive_on_heading" not in world.names()
     assert world.names().count("nav2__backup_robot") == 1  # the one look from farther back
 
@@ -176,7 +176,7 @@ def test_failed_turn_stops_the_skill():
     world.call_tool_prefixed = refuse
     result = _run(world)
     assert not result["success"]
-    assert "turn failed" in result["reason"]
+    assert result["failure"] == "turn_failed"
     assert "nav2__drive_on_heading" not in world.names()
 
 
@@ -209,7 +209,7 @@ def test_object_lost_far_from_the_standoff_still_fails():
     world.blind_below = 3.0
     result = _run(world)
     assert not result["success"]
-    assert "lost" in result["reason"]
+    assert result["failure"] == "lost"
     assert world.names().count("nav2__drive_on_heading") == 1
 
 
@@ -277,3 +277,63 @@ def test_refused_backup_still_searches():
     assert result["success"], result["reason"]
     assert world.names()[:4].count("nav2__backup_robot") == 1
     assert "nav2__spin_robot" in world.names()
+
+
+def test_perception_down_is_not_reported_as_not_found():
+    world = FakeWorld(obj=(2.0, 0.0))
+
+    async def sam3_down(name, args, _orig=world.call_tool_prefixed):
+        if name == "perception__segment_objects":
+            world.calls.append((name, args))
+            return "ERROR: Connection failed"
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = sam3_down
+    result = _run(world)
+    assert not result["success"]
+    assert result["failure"] == "perception_error"  # approach_15d: SAM3 unreachable
+    assert "nav2__drive_on_heading" not in world.names()
+
+
+def test_arm_failure_names_the_moveit_verdict():
+    world = FakeWorld()
+
+    async def arm_fails(name, args, _orig=world.call_tool_prefixed):
+        if name == "moveit__plan_and_execute":
+            world.calls.append((name, args))
+            return ("Plan and execute operation submitted. Operation ID: 9d74\n"
+                    "--- Execution Result ---\nOperation: 9d74\nStatus: completed\nExecution failed.")
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = arm_fails
+    result = _run(world)
+    assert result["failure"] == "arm_failed"
+    assert "Execution failed" in result["reason"] and "Operation ID" not in result["reason"]
+    assert "The base did not move." in result["reason"]
+
+
+def test_refused_drive_is_reported_with_where_the_object_is():
+    world = FakeWorld(obj=(2.0, 0.0))
+
+    async def blocked(name, args, _orig=world.call_tool_prefixed):
+        if name == "nav2__drive_on_heading":
+            world.calls.append((name, args))
+            return json.dumps({"error": "NavigationError", "message": "Drive on heading operation failed",
+                               "error_code": "NAVIGATION_FAILED"}, indent=2)
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = blocked
+    result = _run(world)
+    assert result["failure"] == "drive_failed"
+    assert "1.96 m" in result["reason"]  # where it saw the object
+    assert "did not move" not in result["reason"]  # approach_24: it drove until the obstacle
+    assert "stopped partway through a 0.80 m drive" in result["reason"]
+
+
+def test_failure_carries_the_steps_and_success_does_not():
+    world = FakeWorld(name="green cube")
+    failed = asyncio.run(approach.run(world, "red ball", "pick"))
+    assert any("backup 0.40 m" in line for line in failed["steps"])
+    assert "turned 6 times" in failed["reason"]
+    world = FakeWorld(obj=(2.0, 0.0))
+    assert "steps" not in _run(world)

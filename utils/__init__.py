@@ -12,8 +12,10 @@ utilities live in the calling skill's own file.
 
 import asyncio
 import json
+import logging
 import re
 import time
+from contextlib import contextmanager
 from typing import Any
 
 from skill_based.clients.mcp import MCPClient
@@ -43,6 +45,38 @@ GRIPPER_OPEN = 0.0
 GRIPPER_CLOSED = 0.7
 HOLD_MIN = 0.05
 HOLD_MAX = 0.68
+
+
+# segment_objects answers that say something about the scene; anything else is a perception failure.
+SEG_ANSWERS = ("SUCCESS", "NO_OBJECTS_FOUND")
+
+
+@contextmanager
+def collect_steps(log: logging.Logger):
+    """Collect what ``log`` reports inside the block: a skill result's ``steps``."""
+    lines: list[str] = []
+
+    class _Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append(record.getMessage())
+
+    handler, level = _Keep(logging.INFO), log.level
+    log.addHandler(handler)
+    if log.getEffectiveLevel() > logging.INFO:
+        log.setLevel(logging.INFO)
+    try:
+        yield lines
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)
+
+
+def motion_error(result: Any) -> str:
+    """The moveit MCP's verdict on a motion, without the operation id boilerplate."""
+    text = str(result).split("--- Execution Result ---")[-1]
+    skip = ("Operation", "Progress", "Use get_execution_status", "Plan and execute operation submitted")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith(skip)]
+    return "; ".join(lines)[:200] or "no reply"
 
 
 def motion_ok(result: str) -> bool:
@@ -211,7 +245,7 @@ async def move_arm_to_look_forward(mcp: MCPClient) -> dict:
                 "reason": "named_state look_forward (joint_state fallback)",
                 "raw": result[:200],
             }
-        reason = f"named_state failed: {result[:200]}"
+        reason = f"named_state failed: {motion_error(result)}"
         if last_error:
             reason = f"joint_state error: {last_error}; " + reason
         return {"success": False, "reason": reason}
@@ -347,4 +381,4 @@ async def plan_to_xyz(
                 await reset_scene(mcp)
             except Exception as e:
                 return False, f"scene reset before the retry failed: {e}", calls
-    return False, f"plan failed at ({x:.2f},{y:.2f},{z:.2f}): {result[-200:]}", calls
+    return False, f"plan failed at ({x:.2f},{y:.2f},{z:.2f}): {motion_error(result)}", calls

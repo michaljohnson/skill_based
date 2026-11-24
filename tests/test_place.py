@@ -122,7 +122,7 @@ def test_out_of_reach_bin_fails_before_any_drop_motion():
     mcp = FakeMCP(bin_pose=far)
     result = _run(mcp)
     assert not result["success"]
-    assert "Navigator" in result["reason"]
+    assert result["failure"] == "out_of_reach"
     assert not any(n == "ros__send_action_goal" for n in mcp.names())
 
 
@@ -137,7 +137,7 @@ def test_object_not_seen_after_release_is_a_failure():
     mcp = FakeMCP(seg=lambda prompt, camera: "NO_OBJECTS_FOUND" if prompt == "green cube" else "SUCCESS")
     result = _run(mcp)
     assert not result["success"]
-    assert "verify" in result["reason"]
+    assert result["failure"] == "verify_failed" and result["holding"] is False
 
 
 NO_CLOUD = {"error": "Segmentation of 'green cube' on arm camera reported SUCCESS, but its point cloud did not arrive. Nothing is cached; segment again."}
@@ -372,7 +372,7 @@ def test_nothing_held_stops_before_any_motion(finger):
     mcp = FakeMCP(finger=finger)
     result = _run(mcp)
     assert not result["success"]
-    assert "nothing held" in result["reason"]
+    assert result["failure"] == "not_holding"
     assert not any(n.startswith("moveit__") for n, _ in mcp.calls)
 
 
@@ -383,7 +383,7 @@ def test_aborted_drop_motion_is_a_failure():
     mcp = FakeMCP(drop_reply=aborted)
     result = _run(mcp)
     assert not result["success"]
-    assert "drop pose plan failed" in result["reason"]
+    assert result["failure"] == "motion_failed"
     assert not any(n == "ros__send_action_goal" and a["goal"]["command"]["position"] == 0.0 for n, a in mcp.calls)
 
 
@@ -471,3 +471,39 @@ def test_deep_grasp_keeps_the_fingertips_above_the_surface():
     box_top = box["position"][2] + box["dimensions"][2] / 2
     fingertips = _drop_heights(mcp)[-1] - 0.225
     assert fingertips - box_top == pytest.approx(0.01)
+
+
+SHELF = {  # place_surface_1: SAM3 picked a grey object on a shelf 4.3 m away
+    "grasp_pose": {"frame_id": "base_footprint", "position": {"x": 3.95, "y": -1.60, "z": 2.0},
+                   "orientation": {"x": 1.0, "y": 0.0, "z": 0.0, "w": 0.0}},
+    "bbox_base_frame": {"x_min": 3.9, "x_max": 4.0, "y_min": -1.65, "y_max": -1.55, "z_min": 1.75, "z_max": 1.84},
+    "top_z": 1.84,
+}
+
+
+def test_far_target_is_reported_as_another_object():
+    mcp = FakeMCP(bin_pose=SHELF)
+    result = _run(mcp, "surface", height=0.07, pads=0.035)
+    assert result["failure"] == "implausible_target" and result["holding"] is True
+    assert not any(n == "moveit__add_collision_box" and a["object_id"] != "floor" for n, a in mcp.calls)
+
+
+def test_missing_cloud_is_a_perception_error():
+    no_cloud = {"error": "SAM3 reported SUCCESS, but its point cloud did not arrive."}  # place_surface_5
+    mcp = FakeMCP(seg=lambda prompt, camera: no_cloud if camera == "arm" else "NO_OBJECTS_FOUND")
+    result = _run(mcp)
+    assert result["failure"] == "perception_error" and result["holding"] is True
+    assert "SUCCESS_NO_CLOUD" in result["reason"]
+
+
+def test_target_not_seen_is_not_found_and_still_held():
+    mcp = FakeMCP(seg=lambda prompt, camera: "NO_OBJECTS_FOUND")
+    result = _run(mcp)
+    assert result["failure"] == "target_not_found" and result["holding"] is True
+    assert result["steps"]
+
+
+def test_success_says_the_object_is_released():
+    result = _run(FakeMCP())
+    assert result["success"] and result["holding"] is False
+    assert "Arm at look_forward." in result["reason"]
