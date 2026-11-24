@@ -53,7 +53,8 @@ class FakeMCP(_PickFake):
             raise RuntimeError("scene service unavailable")
         if name == "perception__segment_objects":
             self.calls.append((name, args))
-            return json.dumps({"status": self.seg(args["prompt"], args["camera"])})
+            reply = self.seg(args["prompt"], args["camera"])
+            return json.dumps(reply if isinstance(reply, dict) else {"status": reply})
         if name == "perception__get_topdown_grasp_pose":
             self.calls.append((name, args))
             return json.dumps(self.bin_pose)
@@ -137,6 +138,24 @@ def test_object_not_seen_after_release_is_a_failure():
     result = _run(mcp)
     assert not result["success"]
     assert "verify" in result["reason"]
+
+
+NO_CLOUD = {"error": "Segmentation of 'green cube' on arm camera reported SUCCESS, but its point cloud did not arrive. Nothing is cached; segment again."}
+TIMEOUT = {"error": "Timeout (20s) waiting for segmentation result on /seg_status."}
+
+
+def test_object_found_without_its_cloud_counts_as_placed():
+    mcp = FakeMCP(seg=lambda prompt, camera: NO_CLOUD if prompt == "green cube" else "SUCCESS")
+    result = _run(mcp)
+    assert result["success"], result["reason"]
+
+
+def test_segmentation_error_is_reported_as_unverified_not_missed():
+    mcp = FakeMCP(seg=lambda prompt, camera: TIMEOUT if prompt == "green cube" else "SUCCESS")
+    result = _run(mcp)
+    assert not result["success"]
+    assert "could not verify" in result["reason"]
+    assert "missed" not in result["reason"]
 
 
 def test_bin_falls_back_to_the_front_camera():
