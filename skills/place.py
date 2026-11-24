@@ -48,7 +48,13 @@ async def _segment(
             "perception__segment_objects",
             {"prompt": prompt, "camera": camera, "timeout": 20},
         )
-        return parse_seg_status(raw), 1
+        status = parse_seg_status(raw)
+        if status == "UNKNOWN":
+            logger.warning(f"segment_objects({camera}) '{prompt}': {raw}")
+            # SAM3 found it, only the point cloud is missing: enough to know it is there
+            if "reported SUCCESS" in str(raw):
+                status = "SUCCESS_NO_CLOUD"
+        return status, 1
     except Exception as e:
         logger.warning(f"segment_objects({camera}) error: {e}")
         return "ERROR", 1
@@ -94,13 +100,20 @@ async def _verify_object_visible_from_above(
         logger.info(
             f"  [place-verify {attempt+1}/2] arm SAM3 '{object_name}' -> {status}"
         )
-        if status == "SUCCESS":
+        if status in ("SUCCESS", "SUCCESS_NO_CLOUD"):
             return (
                 True,
                 f"'{object_name}' visible on arm camera above the drop point "
                 f"(settled, attempt {attempt+1})",
                 calls,
             )
+    if status != "NO_OBJECTS_FOUND":
+        return (
+            False,
+            f"could not verify '{object_name}': segmentation error ({status}); "
+            "the drop itself may have worked",
+            calls,
+        )
     return (
         False,
         f"'{object_name}' NOT visible on arm camera above the drop point after "
