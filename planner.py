@@ -221,12 +221,16 @@ async def run_planner(
     task: str,
     model: str | None = None,
     max_turns: int = 50,
+    result_detail: str = "reason",
 ) -> dict:
     """Run the planner LLM on a natural-language task.
 
     Returns:
         ``{"summary": str, "turns_used": int, "skill_tool_calls_total": int,
         "success": bool}``
+
+        ``result_detail``: what of a failed skill result the LLM sees,
+        "reason" (the result without its ``steps``) or "steps" (all of it).
 
         ``skill_tool_calls_total`` sums the MCP tool calls each skill
         made internally. Parallels ``subagent_tool_calls_total`` in the
@@ -281,8 +285,10 @@ async def run_planner(
                 logger.info(f"<- {name} : True ({calls} calls) {reason}")
             else:
                 logger.warning(
-                    f"<- {name} : False ({calls} calls) {reason}"
+                    f"<- {name} : False [{result.get('failure')}] ({calls} calls) {reason}"
                 )
+            if result_detail != "steps":
+                result = {k: v for k, v in result.items() if k != "steps"}
             messages.append(tool_result_message(tool_call_id, json.dumps(result)))
 
     return {

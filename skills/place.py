@@ -11,6 +11,10 @@ The planner picks the mode with the ``mode`` argument:
 
 Surface and floor need the held object's height, which pick returns as
 ``held_object_height_m``; container mode ignores it.
+
+Every result says whether the gripper still holds the object (``holding``:
+true, false, or null when unknown); a failure adds its kind (``failure``) and
+the log lines of the call (``steps``).
 """
 
 import asyncio
@@ -23,7 +27,9 @@ from skill_based.utils import (
     GRIPPER_OPEN,
     HOLD_MAX,
     HOLD_MIN,
+    SEG_ANSWERS,
     TOPDOWN_ORIENTATION as _TOPDOWN,
+    collect_steps,
     geometric_fallback_prompts,
     gripper_command,
     gripper_position,
@@ -160,21 +166,25 @@ FLOOR_REACH_MIN_M = 0.50
 # Surface and floor: straight up this far after the release, so the open fingers clear the
 # object and the arm camera is far enough above it to segment it (at the drop pose it is too close).
 VERIFY_LIFT_M = 0.20
+# A target segmented farther than this is another object of the same kind (the shelf object, 4.3 m).
+IMPLAUSIBLE_DIST_M = 2.0
 
 
 async def _segment_any(
     mcp: MCPClient, prompts: list[str], cameras: tuple[str, ...]
-) -> tuple[str | None, int]:
-    """First (camera, prompt) that segments; returns (prompt, calls)."""
+) -> tuple[str | None, int, list[str]]:
+    """First (camera, prompt) that segments; returns (prompt, calls, statuses seen)."""
     calls = 0
+    statuses = []
     for camera in cameras:
         for prompt in prompts:
             status, c = await _segment(mcp, prompt, camera=camera)
             calls += c
+            statuses.append(f"{camera}: {status}")
             logger.info(f"{camera} SAM3 '{prompt}' -> {status}")
             if status == "SUCCESS":
-                return prompt, calls
-    return None, calls
+                return prompt, calls, statuses
+    return None, calls, statuses
 
 
 async def _run_drop(
@@ -192,37 +202,62 @@ async def _run_drop(
     the flange to the drop point, opens the gripper and checks the object from
     above with the arm camera. They differ only in the drop point and the box.
     """
+    with collect_steps(logger) as steps:
+        return await _drop(mcp, target_location, object_name, mode, object_height_m, pads_above_bottom_m, steps)
+
+
+async def _drop(
+    mcp: MCPClient,
+    target_location: str,
+    object_name: str,
+    mode: Mode,
+    object_height_m: float,
+    pads_above_bottom_m: float | None,
+    steps: list[str],
+) -> dict:
     tool_calls = 0
     base = {"target_location": target_location}
+    unmoved = f"Arm at look_forward, still holding '{object_name}'."
 
-    def fail(reason: str) -> dict:
-        return {**base, "success": False, "reason": reason, "tool_calls_used": tool_calls}
+    def fail(failure: str, reason: str, holding: bool | None = True) -> dict:
+        return {**base, "success": False, "failure": failure, "reason": reason, "holding": holding,
+                "tool_calls_used": tool_calls, "steps": list(steps)}
 
     logger.info(f"place -> {mode} '{target_location}' object='{object_name}' obj_h={object_height_m:.3f}")
     if mode in ("surface", "floor") and not object_height_m > 0:
-        return fail(f"{mode} mode needs the held object's height: pass pick's held_object_height_m")
+        return fail("invalid_args", f"{mode} mode needs the held object's height: pass pick's "
+                                    "held_object_height_m. Nothing moved.")
 
     finger = await gripper_position(mcp)
     tool_calls += 1
     if finger is None or not HOLD_MIN <= finger <= HOLD_MAX:
-        return fail(f"nothing held (finger_joint {finger}): pick first")
+        return fail("not_holding", f"Nothing held (finger_joint {finger}): pick first. Nothing moved.",
+                    holding=False if finger is not None else None)
 
     arm = await move_arm_to_look_forward(mcp)
     tool_calls += 1
     if not arm.get("success"):
-        return fail(f"arm reset failed: {arm.get('reason')}")
+        return fail("arm_failed", f"Moving the arm to look_forward failed ({arm.get('reason')}), still "
+                                  f"holding '{object_name}'. Usually the UR program is not running.")
     tool_calls += 2
     try:
         await reset_scene(mcp)
     except Exception as e:
-        return fail(f"planning scene reset failed, no floor in the scene: {e}")
+        return fail("scene_failed", f"Planning scene reset failed ({e}); without the floor box the arm "
+                                    f"is not planned safely. {unmoved}")
 
-    prompt, calls = await _segment_any(
+    prompt, calls, looks = await _segment_any(
         mcp, geometric_fallback_prompts(target_location), ("arm", "front")
     )
     tool_calls += calls
     if prompt is None:
-        return fail(f"'{target_location}' not segmented on either camera")
+        if all(look.split(": ", 1)[1] in SEG_ANSWERS for look in looks):
+            return fail("target_not_found", (
+                f"'{target_location}' not found by the arm or the front camera from here. {unmoved} "
+                f"Approach it first (next_action {mode}_place), or it is not here."))
+        return fail("perception_error", (
+            f"Segmentation of '{target_location}' did not work ({', '.join(looks)}); SUCCESS_NO_CLOUD means "
+            f"SAM3 found it but the camera sent no point cloud (camera hung). {unmoved}"))
 
     try:
         raw = await mcp.call_tool_prefixed(
@@ -239,7 +274,7 @@ async def _run_drop(
         if mode in ("surface", "floor"):
             bbox = {k: float(data["bbox_base_frame"][k]) for k in ("x_min", "x_max", "y_min", "y_max")}
     except Exception as e:
-        return fail(f"no {mode} pose from the segmented cloud: {e}")
+        return fail("perception_error", f"No {mode} pose from the segmented cloud ({e}). {unmoved}")
     tool_calls += 1
 
     def set_down_z(support: float) -> float:
@@ -260,17 +295,22 @@ async def _run_drop(
         near = (bbox["x_min"] ** 2 + min(max(0.0, bbox["y_min"]), bbox["y_max"]) ** 2) ** 0.5
         offset = max(0.0, ref - near) + FLOOR_GAP_M
         if ref <= offset:
-            return fail(f"reference at {ref:.2f} m is too close to put anything in front of it")
+            return fail("too_close", f"'{target_location}' at {ref:.2f} m is too close to put anything in "
+                                     f"front of it. {unmoved} Back up.")
         cx, cy = cx * (1 - offset / ref), cy * (1 - offset / ref)
         drop_z = set_down_z(0.0)
         box_pos = [(bbox["x_min"] + bbox["x_max"]) / 2, (bbox["y_min"] + bbox["y_max"]) / 2, top / 2]
         box_dim = [bbox["x_max"] - bbox["x_min"], bbox["y_max"] - bbox["y_min"], top]
     else:
         if not SURFACE_TOP_MIN_M <= top <= SURFACE_TOP_MAX_M:
-            return fail(
-                f"surface top at {top:.2f} m is outside {SURFACE_TOP_MIN_M:.2f}-{SURFACE_TOP_MAX_M:.2f} m "
-                "(lower: use floor mode; higher: out of top-down reach)"
-            )
+            far = (cx ** 2 + cy ** 2) ** 0.5
+            if far > IMPLAUSIBLE_DIST_M:
+                return fail("implausible_target", (
+                    f"Segmented a '{target_location}' {far:.1f} m away with its top at {top:.2f} m: almost "
+                    f"certainly another object, not the target. {unmoved} The target is probably not in view."))
+            return fail("invalid_target", (
+                f"'{target_location}' top at {top:.2f} m is outside {SURFACE_TOP_MIN_M:.2f}-"
+                f"{SURFACE_TOP_MAX_M:.2f} m (lower: use floor mode; higher: out of top-down reach). {unmoved}"))
         if (cx ** 2 + cy ** 2) ** 0.5 > CONTAINER_REACH_REAL_M:
             cx = min(cx, bbox["x_min"] + SURFACE_EDGE_INSET_M)
         drop_z = set_down_z(top)
@@ -280,12 +320,17 @@ async def _run_drop(
     dist = (cx ** 2 + cy ** 2) ** 0.5
     logger.info(f"{mode} drop=({cx:.3f},{cy:.3f}) top={top:.3f} drop_z={drop_z:.3f} dist={dist:.2f}")
     if dist > CONTAINER_REACH_REAL_M:
-        return fail(
-            f"{mode} at {dist:.2f} m > {CONTAINER_REACH_REAL_M:.2f} m. "
-            "Navigator must redeliver closer."
-        )
+        if dist > IMPLAUSIBLE_DIST_M:
+            return fail("implausible_target", (
+                f"Segmented a '{target_location}' {dist:.1f} m away: probably another object, not the target. "
+                f"{unmoved} The target is probably not in view."))
+        return fail("out_of_reach", (
+            f"'{target_location}' drop point {dist:.2f} m away, beyond the arm's {CONTAINER_REACH_REAL_M:.2f} m. "
+            f"{unmoved} Approach it again (next_action {mode}_place)."))
     if mode == "floor" and dist < FLOOR_REACH_MIN_M:
-        return fail(f"floor drop at {dist:.2f} m < {FLOOR_REACH_MIN_M:.2f} m: too close to the robot. Back up.")
+        return fail("too_close", (
+            f"Floor drop point {dist:.2f} m away, closer than {FLOOR_REACH_MIN_M:.2f} m to the robot. {unmoved} "
+            "Back up."))
 
     box_id = "reference" if mode == "floor" else mode  # "floor" is the planning scene's floor box
     try:
@@ -297,7 +342,7 @@ async def _run_drop(
             raise RuntimeError(str(reply)[:200])
     except Exception as e:
         await move_arm_to_look_forward(mcp)
-        return fail(f"{box_id} collision box not added: {e}")
+        return fail("scene_failed", f"The {box_id} collision box was not added ({e}). {unmoved}")
     tool_calls += 1
 
     stops = [drop_z] if mode == "container" else [drop_z + SURFACE_APPROACH_M, drop_z]
@@ -307,15 +352,20 @@ async def _run_drop(
         if not ok:
             await move_arm_to_look_forward(mcp)
             tool_calls += 1
-            return fail(f"drop pose plan failed at z={z:.3f}: {info}")
+            return fail("motion_failed", (
+                f"Moving to the drop pose ({cx:.2f}, {cy:.2f}, {z:.2f}) m failed: {info.rstrip('.')}. {unmoved}"))
 
     try:
         opened = await gripper_command(mcp, GRIPPER_OPEN)
     except Exception as e:
-        return fail(f"open_gripper error: {e} (arm above the {mode}, object maybe still held)")
+        return fail("gripper_failed", (
+            f"Opening the gripper failed ({e}); '{object_name}' may still be held. Arm above the {mode}."),
+            holding=None)
     tool_calls += 1
     if not opened["position"] <= HOLD_MIN:  # also fails on a missing position (NaN)
-        return fail(f"gripper did not open (position {opened['position']:.3f}); arm above the {mode}")
+        return fail("gripper_failed", (
+            f"The gripper did not open (position {opened['position']:.3f}), still holding '{object_name}'. "
+            f"Arm above the {mode}."))
 
     if mode != "container":
         ok, info, calls = await plan_to_xyz(mcp, cx, cy, drop_z + VERIFY_LIFT_M, _TOPDOWN, reset_on_retry=False)
@@ -331,13 +381,18 @@ async def _run_drop(
     tool_calls += 1
     if not arm.get("success"):
         logger.warning(f"post-release look_forward failed: {arm.get('reason')}")
+    arm_at = "Arm at look_forward." if arm.get("success") else f"Arm above the {mode} (look_forward failed)."
     if not visible:
-        return fail(f"placement verify failed: {vinfo}")
+        failure = "verify_failed" if "NOT visible" in vinfo else "verify_unavailable"
+        return fail(failure, f"Released '{object_name}' at ({cx:.2f}, {cy:.2f}, {drop_z:.2f}) m, then: {vinfo}. "
+                             f"{arm_at}", holding=False)
     where = {"container": "into", "surface": "onto", "floor": "next to"}[mode]
     return {
         **base,
         "success": True,
-        "reason": f"placed {where} {target_location} at ({cx:.2f},{cy:.2f},{drop_z:.2f}); {vinfo}",
+        "reason": f"Placed '{object_name}' {where} '{target_location}' at ({cx:.2f}, {cy:.2f}, {drop_z:.2f}) m; "
+                  f"{vinfo}. {arm_at}",
+        "holding": False,
         "tool_calls_used": tool_calls,
     }
 

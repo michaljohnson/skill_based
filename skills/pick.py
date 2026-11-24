@@ -10,7 +10,9 @@ The deterministic implementation removes the LLM's turn-by-turn reasoning
 and bakes the canonical sequence into Python with bounded retries. On
 failure it returns a structured reason string; the planner does not
 retry inside the skill but may choose to call pick again after the
-navigator re-positions.
+navigator re-positions. Every result says whether the gripper holds the
+object (``holding``: true, false, or null when unknown); a failure adds its
+kind (``failure``) and the log lines of the call (``steps``).
 """
 
 import json
@@ -23,6 +25,8 @@ from skill_based.utils import (
     GRIPPER_OPEN,
     HOLD_MAX,
     HOLD_MIN,
+    SEG_ANSWERS,
+    collect_steps,
     gripper_command,
     gripper_position,
     holding,
@@ -71,16 +75,24 @@ async def _segment_object(
     object_name: str,
     camera: str = "arm",
 ) -> tuple[str, int]:
-    """Segment ``object_name`` on the requested camera, return (status, calls)."""
+    """Segment ``object_name`` on the requested camera, return (status, calls).
+
+    SUCCESS_NO_CLOUD: SAM3 found it but the point cloud never arrived (camera hung).
+    """
     try:
         raw = await mcp.call_tool_prefixed(
             "perception__segment_objects",
             {"prompt": object_name, "camera": camera, "timeout": 20},
         )
-        return parse_seg_status(raw), 1
+        status = parse_seg_status(raw)
+        if status == "UNKNOWN":
+            logger.warning(f"segment_objects({camera}) reply: {str(raw)[:300]}")
+            if "reported SUCCESS" in str(raw):
+                status = "SUCCESS_NO_CLOUD"
+        return status, 1
     except Exception as e:
         logger.warning(f"segment_objects({camera}) error: {e}")
-        return "ERROR", 1
+        return f"ERROR: {e}"[:80], 1
 
 
 async def _grasp_pose(
@@ -132,15 +144,22 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     (navigator owns positioning). Arm in any state.
 
     Returns:
-        ``{"success", "reason", "object_name", "tool_calls_used"}`` and on
-        success ``held_object_height_m`` and ``pads_above_bottom_m`` (how far
-        the pad middle sits above the object's lowest point, for place).
+        ``{"success", "reason", "holding", "object_name", "tool_calls_used"}``;
+        on success ``held_object_height_m`` and ``pads_above_bottom_m`` (how far
+        the pad middle sits above the object's lowest point, for place), on
+        failure ``failure`` and ``steps``.
     """
+    with collect_steps(logger) as steps:
+        return await _run(mcp, object_name, steps)
+
+
+async def _run(mcp: MCPClient, object_name: str, steps: list[str]) -> dict:
     tool_calls = 0
     base_result = {"object_name": object_name}
 
-    def fail(reason: str) -> dict:
-        return {**base_result, "success": False, "reason": reason, "tool_calls_used": tool_calls}
+    def fail(failure: str, reason: str, holding: bool | None = False) -> dict:
+        return {**base_result, "success": False, "failure": failure, "reason": reason,
+                "holding": holding, "tool_calls_used": tool_calls, "steps": list(steps)}
 
     # Step 0 — the gripper must be open; a closed one may still hold something
     try:
@@ -150,58 +169,71 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
         logger.warning(f"gripper position read error: {e}")
     tool_calls += 1
     if finger is None:
-        return fail("gripper position unknown (/joint_states without finger_joint)")
+        return fail("gripper_failed", "Gripper position unknown (/joint_states without finger_joint); "
+                                      "nothing moved.", holding=None)
     if finger > HOLD_MIN:
-        return fail(
-            f"gripper not open (finger_joint {finger:.3f}): it may hold an object. "
-            "Place or open it first."
-        )
+        held = HOLD_MIN <= finger <= HOLD_MAX
+        return fail("gripper_not_open", (
+            f"The gripper is not open (finger_joint {finger:.3f}): "
+            f"{'it probably holds an object, place it first' if held else 'it is closed, open it first'}. "
+            "Nothing moved."), holding=held)
 
     # Step 1 — arm to look_forward (joint_state primary)
     arm = await move_arm_to_look_forward(mcp)
     tool_calls += 1
     if not arm.get("success"):
-        return fail(f"arm reset failed: {arm.get('reason')}")
+        return fail("arm_failed", f"Moving the arm to look_forward failed ({arm.get('reason')}). "
+                                  "Usually the UR program is not running.")
 
     # Step 2 — planning scene: drop stale objects, keep the floor
     tool_calls += 2
     try:
         await reset_scene(mcp)
     except Exception as e:
-        return fail(f"planning scene reset failed, no floor in the scene: {e}")
+        return fail("scene_failed", f"Planning scene reset failed ({e}); without the floor box the arm "
+                                    "is not planned safely. Arm at look_forward.")
 
     # Step 3 — segment on arm camera; front-cam fallback if missed
     status, calls = await _segment_object(mcp, object_name, camera="arm")
     tool_calls += calls
+    arm_status = status
     logger.info(f"arm SAM3 -> {status}")
     if status != "SUCCESS":
         status, calls = await _segment_object(mcp, object_name, camera="front")
         tool_calls += calls
         logger.info(f"front SAM3 fallback -> {status}")
         if status != "SUCCESS":
-            return fail(f"segmentation failed on both cameras for '{object_name}'")
+            looks = (arm_status, status)
+            if all(s in SEG_ANSWERS for s in looks):
+                return fail("not_found", (
+                    f"'{object_name}' not found by the arm or the front camera from here. Arm at look_forward. "
+                    "Approach it first (next_action pick), or it is not here."))
+            return fail("perception_error", (
+                f"Segmentation of '{object_name}' did not work (arm: {arm_status}, front: {status}); "
+                "SUCCESS_NO_CLOUD means SAM3 found it but the camera sent no point cloud (camera hung). "
+                "Arm at look_forward."))
 
     # Step 4 — top-down grasp pose
     grasp, calls = await _grasp_pose(mcp, object_name)
     tool_calls += calls
     if grasp is None:
-        return fail("get_topdown_grasp_pose returned no centroid_base_frame")
+        return fail("perception_error", "Segmented, but get_topdown_grasp_pose gave no centroid "
+                                        "(point cloud missing?). Arm at look_forward.")
     pose = grasp.get("grasp_pose")
     if not pose or "position" not in pose:
-        return fail(
-            "get_topdown_grasp_pose returned no grasp_pose "
-            f"(possibly TF failure): keys={list(grasp.keys())}"
-        )
+        return fail("perception_error", (
+            f"get_topdown_grasp_pose returned no grasp_pose (possibly a TF failure; keys {list(grasp.keys())}). "
+            "Arm at look_forward."))
     try:
         gx, gy, gz = (float(pose["position"][k]) for k in ("x", "y", "z"))
         pre = grasp.get("pre_grasp_pose")
         pre_z = float(pre["position"]["z"]) if pre else gz + PRE_GRASP_CLEARANCE_M
         orientation = _orientation_to_list(pose["orientation"])
     except (KeyError, TypeError, ValueError) as e:
-        return fail(f"malformed grasp pose from perception: {e!r}")
+        return fail("perception_error", f"Malformed grasp pose from perception ({e!r}). Arm at look_forward.")
     values = (gx, gy, gz, pre_z, *orientation)
     if len(orientation) != 4 or not all(math.isfinite(v) for v in values):
-        return fail(f"malformed grasp pose from perception: {values}")
+        return fail("perception_error", f"Malformed grasp pose from perception ({values}). Arm at look_forward.")
 
     # Heights in base_footprint (the camera-frame bounding box measures depth,
     # not height). None if missing: place must not guess a height.
@@ -225,20 +257,20 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
 
     # Step 5 — reach check
     if gx > UR5_REACH_X:
-        return fail(
-            f"grasp x={gx:.2f}m exceeds UR5 reach {UR5_REACH_X:.2f}m. "
-            "Navigator must redeliver closer."
-        )
+        return fail("out_of_reach", (
+            f"'{object_name}' grasp point {gx:.2f} m ahead, beyond the arm's {UR5_REACH_X:.2f} m reach. "
+            "Arm at look_forward. Approach it again (next_action pick)."))
 
     # Step 6 — open gripper
     try:
         opened = await gripper_command(mcp, GRIPPER_OPEN)
     except Exception as e:
-        return fail(f"open_gripper error: {e}")
+        return fail("gripper_failed", f"Opening the gripper failed ({e}). Arm at look_forward.", holding=None)
     tool_calls += 1
     # `not <=` also fails on a missing position (NaN)
     if not opened["position"] <= HOLD_MIN:
-        return fail(f"gripper did not open (position {opened['position']:.3f}); arm not moved down")
+        return fail("gripper_failed", (
+            f"The gripper did not open (position {opened['position']:.3f}). Arm at look_forward."), holding=None)
 
     # Step 7 — orientation with the smaller wrist turn, then pre-grasp
     try:
@@ -249,7 +281,9 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     ok, info, calls = await _plan_to_xyz(mcp, gx, gy, pre_z, orientation)
     tool_calls += calls
     if not ok:
-        return fail(f"pre-grasp plan failed: {info}")
+        return fail("motion_failed", (
+            f"Moving above '{object_name}' failed at ({gx:.2f}, {gy:.2f}, {pre_z:.2f}) m: {info.rstrip('.')}. "
+            "Arm at look_forward."))
 
     # Step 8 — descend to grasp z
     ok, info, calls = await _plan_to_xyz(mcp, gx, gy, gz, orientation)
@@ -258,8 +292,11 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
         back, back_info, calls = await _plan_to_xyz(mcp, gx, gy, pre_z, orientation)
         tool_calls += calls
         if not back:
-            return fail(f"descent plan failed: {info}; retract failed too, arm near the grasp pose: {back_info}")
-        return fail(f"descent plan failed: {info}")
+            return fail("motion_failed", (
+                f"Moving down to '{object_name}' failed ({info}), and the retract failed too ({back_info}). "
+                "Arm near the grasp pose, gripper open."))
+        return fail("motion_failed", (
+            f"Moving down to '{object_name}' at z {gz:.2f} m failed: {info.rstrip('.')}. Arm above the object, gripper open."))
 
     # Step 9 — close gripper; the hold is judged from where the fingers stalled
     try:
@@ -277,10 +314,9 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
             finger = None
         tool_calls += 1
         if finger is None or not (math.isfinite(finger) and finger >= HOLD_MAX):
-            return fail(
-                f"gripper state unknown after the close (finger_joint {finger}); "
-                "it may hold the object, arm left at the grasp pose"
-            )
+            return fail("gripper_failed", (
+                f"Gripper state unknown after the close (finger_joint {finger}); it may hold "
+                f"'{object_name}'. Arm at the grasp pose."), holding=None)
         closed = {"position": finger, "stalled": False, "status": None}
     logger.info(
         f"close -> position={closed['position']:.3f} stalled={closed['stalled']} "
@@ -294,16 +330,17 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
         except Exception as e:
             logger.warning(f"recovery after empty grasp failed: {e}")
         tool_calls += 3
-        return fail(
-            f"empty grasp: gripper closed to {closed['position']:.3f} "
-            f"(stalled={closed['stalled']}); object missed or slipped"
-        )
+        return fail("grasp_empty", (
+            f"Empty grasp: the gripper closed to {closed['position']:.3f} without stopping on "
+            f"'{object_name}' (missed or slipped). Gripper opened again, arm back at look_forward. "
+            "The object may have moved; pick again segments it anew."))
 
     # Step 10 — lift back to the pre-grasp height
     ok, info, calls = await _plan_to_xyz(mcp, gx, gy, pre_z, orientation)
     tool_calls += calls
     if not ok:
-        return fail(f"lift failed with the object held, arm left at the grasp pose: {info}")
+        return fail("motion_failed", (
+            f"Holding '{object_name}', but the lift failed ({info}). Arm at the grasp pose."), holding=True)
 
     # Step 11 — return to look_forward (transit posture)
     arm = await move_arm_to_look_forward(mcp)
@@ -314,7 +351,13 @@ async def run(mcp: MCPClient, object_name: str) -> dict:
     return {
         **base_result,
         "success": True,
-        "reason": f"grasped '{object_name}' (gripper stalled at {closed['position']:.3f})",
+        "reason": (
+            f"Holding '{object_name}': grasped at ({gx:.2f}, {gy:.2f}) m, the gripper stopped at "
+            f"{closed['position']:.3f} on the object. "
+            + ("Arm at look_forward." if arm.get("success") else "Arm still above the grasp point "
+               f"(look_forward failed: {arm.get('reason')}).")
+        ),
+        "holding": True,
         "held_object_height_m": held_object_height_m,
         "pads_above_bottom_m": pads_above_bottom_m,
         "tool_calls_used": tool_calls,

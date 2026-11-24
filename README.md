@@ -125,6 +125,12 @@ The `pick` skill measures the held object's height from its SAM3 bounding box an
 
 The planner does NOT see the underlying MCP tool surface. The skills do not call the LLM.
 
+A skill's `reason` is written for the planner: what happened, the evidence (distances, heights, which
+camera) and where the robot is now, in one to three sentences; a perception failure is named as one,
+never as "not found". A failure adds `failure`, one fixed value per kind (the table in `planner.md`), and
+`steps`, the skill's log lines. `pick` and `place` always return `holding`. `--result-detail steps` passes
+the `steps` on to the planner; the default `reason` leaves them out.
+
 ## Adapting to your environment
 
 The skills assume specific MCP tool names (e.g. `perception__segment_objects`, `nav2__drive_on_heading`, `moveit__plan_and_execute`). If your MCP servers expose different names, edit the calls inside `skills/*.py`. The architectural pattern (planner → deterministic skill → MCP tool) is independent of the specific tool names; only the strings need updating.

@@ -97,12 +97,12 @@ async def test_approach(
         print(json.dumps(result, indent=2))
 
 
-async def run_full(task: str) -> None:
+async def run_full(task: str, result_detail: str = "reason") -> None:
     print(f"\n=== Task: {task} ===")
     print(f"Planner: {PLANNER_MODEL}\n")
     async with MCPClient() as mcp:
         t0 = time.perf_counter()
-        result = await run_planner(mcp=mcp, task=task, model=PLANNER_MODEL)
+        result = await run_planner(mcp=mcp, task=task, model=PLANNER_MODEL, result_detail=result_detail)
         wall_seconds = round(time.perf_counter() - t0, 2)
         print(f"\n=== Final Report ===")
         print(result["summary"])
@@ -182,6 +182,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--result-detail",
+        choices=("reason", "steps"),
+        default="reason",
+        help="What the planner sees of a failed skill: reason only, or reason plus the skill's log lines.",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose logging",
@@ -247,6 +253,7 @@ def main() -> None:
                 if msg.startswith("==="):
                     return f"{_BOLD}{msg}{_RESET}"
                 tag = self._TAGS.get(record.name, f"[{record.name}]")
+                tag = f"{self.formatTime(record, '%H:%M:%S')} {tag}"
                 msg = _colorize(msg)
                 if record.levelno >= logging.WARNING:
                     level_color = _RED if record.levelno >= logging.ERROR else _YELLOW
@@ -288,7 +295,7 @@ def main() -> None:
     elif args.test_approach:
         asyncio.run(test_approach(args.test_approach, args.next_action))
     elif args.task:
-        asyncio.run(run_full(args.task))
+        asyncio.run(run_full(args.task, args.result_detail))
     else:
         parser.error(
             "no action specified — pass --task, --test-pick, --test-place, "

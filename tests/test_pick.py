@@ -124,7 +124,7 @@ def test_empty_grasp_fails_and_reopens_the_gripper():
     mcp = FakeMCP(close_position=0.70, close_stalled=False)
     result = _run(mcp)
     assert not result["success"]
-    assert "empty grasp" in result["reason"]
+    assert result["failure"] == "grasp_empty" and result["holding"] is False
     goals = [a["goal"]["command"]["position"] for n, a in mcp.calls if n == "ros__send_action_goal"]
     assert goals[-1] == 0.0
 
@@ -200,7 +200,7 @@ def test_failed_lift_is_a_failed_pick_and_the_arm_stays():
     mcp.call_tool_prefixed = call
     result = _run(mcp)
     assert not result["success"]
-    assert "lift failed" in result["reason"]
+    assert "lift failed" in result["reason"] and result["holding"] is True
     assert len(plans) == 5
 
 
@@ -234,7 +234,7 @@ def test_close_without_a_position_is_unknown_not_empty():
 
 def test_close_error_with_a_fully_closed_reread_is_empty():
     mcp = FakeMCP(close_raises=True, finger_after_close=0.70)
-    assert "empty grasp" in _run(mcp)["reason"]
+    assert _run(mcp)["failure"] == "grasp_empty"
 
 
 def test_malformed_grasp_pose_fails_cleanly():
@@ -244,7 +244,7 @@ def test_malformed_grasp_pose_fails_cleanly():
         mcp = FakeMCP(grasp=grasp)
         result = _run(mcp)
         assert not result["success"]
-        assert "malformed grasp pose" in result["reason"]
+        assert result["failure"] == "perception_error"
         assert mcp.names().count("moveit__plan_and_execute") == 1
 
 
@@ -263,7 +263,7 @@ def test_failed_retract_after_a_failed_descent_is_reported():
 
     mcp.call_tool_prefixed = call
     result = _run(mcp)
-    assert "descent plan failed" in result["reason"]
+    assert result["failure"] == "motion_failed"
     assert "retract failed too" in result["reason"]
 
 
@@ -278,7 +278,7 @@ def test_non_finite_grasp_pose_fails_before_any_motion():
     pose = {**GRASP["grasp_pose"], "position": {"x": float("nan"), "y": -0.07, "z": 0.24}}
     mcp = FakeMCP(grasp={**GRASP, "grasp_pose": pose})
     result = _run(mcp)
-    assert "malformed grasp pose" in result["reason"]
+    assert result["failure"] == "perception_error"
     assert mcp.names().count("moveit__plan_and_execute") == 1  # look_forward only
 
 
@@ -293,7 +293,7 @@ def test_floor_not_restored_stops_the_pick():
     mcp = FakeMCP(box_reply="Error: planning scene monitor not available")
     result = _run(mcp)
     assert not result["success"]
-    assert "scene reset failed" in result["reason"]
+    assert result["failure"] == "scene_failed"
     assert mcp.names().count("moveit__plan_and_execute") == 1  # look_forward only
 
 
@@ -313,7 +313,7 @@ def test_refused_pre_grasp_is_not_success():
     mcp.call_tool_prefixed = call
     result = _run(mcp)
     assert not result["success"]
-    assert "pre-grasp plan failed" in result["reason"]
+    assert result["failure"] == "motion_failed"
     assert not any(n == "ros__send_action_goal" and a["goal"]["command"]["position"] > 0 for n, a in mcp.calls)
 
 
@@ -328,3 +328,37 @@ def test_gripper_position_retries_a_short_message():
             return json.dumps(next(replies))
 
     assert asyncio.run(gripper_position(Joints())) == 0.41
+
+
+def _segmenting(mcp, replies):
+    """Answer segment_objects per camera with the given raw replies."""
+    orig = mcp.call_tool_prefixed
+
+    async def call(name, args):
+        if name == "perception__segment_objects":
+            return replies[args["camera"]]
+        return await orig(name, args)
+
+    mcp.call_tool_prefixed = call
+    return mcp
+
+
+def test_not_seen_on_either_camera_is_not_found():
+    none = json.dumps({"status": "NO_OBJECTS_FOUND"})
+    result = _run(_segmenting(FakeMCP(), {"arm": none, "front": none}))
+    assert result["failure"] == "not_found" and result["holding"] is False
+    assert "steps" in result
+
+
+def test_missing_cloud_is_a_perception_error_not_a_missing_object():
+    no_cloud = "SAM3 reported SUCCESS, but its point cloud did not arrive."  # place_surface_5
+    result = _run(_segmenting(FakeMCP(), {"arm": no_cloud, "front": json.dumps({"status": "NO_OBJECTS_FOUND"})}))
+    assert result["failure"] == "perception_error"
+    assert "SUCCESS_NO_CLOUD" in result["reason"]
+
+
+def test_success_says_holding_and_where_the_arm_is():
+    result = _run(FakeMCP())
+    assert result["success"] and result["holding"] is True
+    assert "Arm at look_forward." in result["reason"]
+    assert "failure" not in result and "steps" not in result

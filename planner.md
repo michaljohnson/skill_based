@@ -66,16 +66,25 @@ place(target_location="white shoe", object_name="red shoe", mode="floor", object
 
 ## Failure handling
 
-When a skill returns `success=false`, look at the `reason` string and pick the next action from this table by matching keywords. Do not invent recoveries that are not in this table.
+Every skill result has a `reason`: what happened, the evidence (distances, heights) and where the
+robot is now. `pick` and `place` also return `holding` (true / false / null = unknown): whether the
+gripper holds the object afterwards. A failed result has a `failure` value; it may also carry `steps`,
+the skill's own log lines, for cases the table does not cover. Choose the next action by `failure`:
 
-| `reason` contains                              | Next action                                                                                          |
-|------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| `attach verify failed` / `gripper not attached`| **Recover, do not end immediately.** The grasp likely missed (for example an elevated segmentation centroid placed the gripper above the object). Call `approach` again with the same args (this re-positions the base and tucks the arm back to `look_forward`), then call `pick` again so it re-segments from the fresh pose. Attempt this approach+pick recovery up to twice; if it still fails, end the task. |
-| `NO_OBJECTS_FOUND` / `target not in view`      | call `approach` again with the same args (target may be out of FOV).                                 |
-| `out of reach` / `too far` / `drive closer`    | call `approach` again with the same args.                                                            |
-| `NAVIGATION_FAILED` / `drive failed` / `drive on heading` | Transient nav failure (nav2 often drives partway). Call `approach` again with the same args, up to twice, then end. |
-| `plan failed` / `MoveIt` / `IK` / `joint_state`| The skill already retried the plan once internally; this is usually a borderline-reach pose. **Recover once**: call `approach` again with the same args (re-positions a few cm closer and resets the arm to `look_forward`), then re-call the manipulation skill. If it still fails, **end the task** (genuine structural failure). |
-| anything else                                  | **End the task**: output the failure as plain text (no tool call). Unknown failure; do not loop.     |
+| `failure` | Skill | Next action |
+|---|---|---|
+| `lost`, `not_facing`, `not_at_standoff`, `turn_failed` | approach | Call `approach` again with the same args, once. |
+| `drive_failed` | approach | Usually an obstacle in the path. Call `approach` again once; if it fails again, end the task. |
+| `not_found` | approach | The object is not within reach of the search. End the task. |
+| `not_found`, `target_not_found`, `out_of_reach`, `too_close`, `implausible_target` | pick, place | Positional: call `approach` for that object with the matching `next_action`, then the skill again, once. |
+| `grasp_empty` | pick | The grasp missed. Call `approach(object, "pick")`, then `pick` again; at most twice. |
+| `motion_failed` | pick, place | Usually a borderline reach. Call `approach` again, then the skill again, once. |
+| `perception_error` | any | The cameras or segmentation failed, not the object. Call the same skill again once; if it fails again, end the task and say perception is not working. |
+| `verify_failed`, `verify_unavailable` | place | The object was released (`holding: false`) but not seen at the drop point (or the check failed). End the task and report it; do not place again. |
+| `arm_failed`, `gripper_failed`, `gripper_not_open`, `not_holding`, `scene_failed`, `invalid_target`, `invalid_args` | any | Needs a human or a different task. End the task and report the reason. |
+
+Use `holding` before every recovery: after a failed `place` with `holding: true` the object is still in
+the gripper, so approach the target again and place; with `holding: false` or null do not call `place`.
 
 Hard rules:
 
