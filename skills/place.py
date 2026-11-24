@@ -139,6 +139,10 @@ PAD_OFFSET_M = 0.188
 # fully below the pads, with more clearance.
 SURFACE_CLEARANCE_M = 0.005
 SURFACE_CLEARANCE_UNMEASURED_M = 0.03
+# Wrist flange to the 2F-140 fingertips (perception's _FINGERTIP_OFFSET_M); after a deep grasp they
+# reach below the held object, so they, not the object, decide how low the flange may go.
+FINGERTIP_OFFSET_M = 0.225
+FINGERTIP_CLEARANCE_M = 0.01
 # The flange goes this far above the drop pose first, then straight down.
 SURFACE_APPROACH_M = 0.08
 # A top lower than this is the floor (floor mode); higher is out of top-down reach.
@@ -241,8 +245,10 @@ async def _run_drop(
     def set_down_z(support: float) -> float:
         """Flange z that puts the held object's bottom just above ``support``."""
         if pads_above_bottom_m is not None and 0 < pads_above_bottom_m <= object_height_m:
-            return support + SURFACE_CLEARANCE_M + pads_above_bottom_m + PAD_OFFSET_M
-        return support + SURFACE_CLEARANCE_UNMEASURED_M + object_height_m + PAD_OFFSET_M
+            z = support + SURFACE_CLEARANCE_M + pads_above_bottom_m + PAD_OFFSET_M
+        else:
+            z = support + SURFACE_CLEARANCE_UNMEASURED_M + object_height_m + PAD_OFFSET_M
+        return max(z, support + FINGERTIP_CLEARANCE_M + FINGERTIP_OFFSET_M)
 
     if mode == "container":
         drop_z = top + CONTAINER_RIM_CLEARANCE_M
