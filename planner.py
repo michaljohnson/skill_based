@@ -69,25 +69,16 @@ PLANNER_TOOLS = [
         "function": {
             "name": "approach",
             "description": (
-                "Move the robot base to a named area, optionally approaching a target object. "
-                "Returns success when the robot is positioned within working distance of the target."
+                "Drive the robot base up to the named object wherever it stands in the room "
+                "(it searches by turning on the spot if the object is not in view). "
+                "Returns success when the object is at working distance for next_action."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target_area": {
-                        "type": "string",
-                        "description": "Named area (e.g. 'kitchen', 'living room', 'kids room', 'bedroom').",
-                    },
                     "object_name": {
                         "type": "string",
-                        "description": (
-                            "Surface or object to approach within the target_area "
-                            "(e.g. 'wooden coffee table', 'trash bin'). Required: "
-                            "the skill always approaches a specific named target. "
-                            "For pure relocation use a dedicated skill instead of "
-                            "this one."
-                        ),
+                        "description": "Object or surface to drive up to (e.g. 'green cube', 'blue container').",
                     },
                     "next_action": {
                         "type": "string",
@@ -95,7 +86,7 @@ PLANNER_TOOLS = [
                         "description": "What the planner intends to do immediately after this call. Controls the approach standoff distance.",
                     },
                 },
-                "required": ["target_area", "object_name", "next_action"],
+                "required": ["object_name", "next_action"],
             },
         },
     },
@@ -197,9 +188,8 @@ async def _dispatch_skill(mcp: MCPClient, name: str, args: dict) -> dict:
     if name == "approach":
         return await approach_skill.run(
             mcp=mcp,
-            target_area=args["target_area"],
-            next_action=args["next_action"],
             object_name=args["object_name"],
+            next_action=args["next_action"],
         )
     if name == "pick":
         return await pick_skill.run(

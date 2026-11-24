@@ -7,7 +7,7 @@ Usage:
     python3 -m skill_based.main --test-place "trash bin" --object-name "white cube" --mode container --object-height-m 0
     python3 -m skill_based.main --test-place "wooden coffee table" --object-name "coke can" --mode surface --object-height-m 0.12
     python3 -m skill_based.main --test-place "white shoe" --object-name "red shoe" --mode floor --object-height-m 0.10
-    python3 -m skill_based.main --test-approach "kitchen" --object-name "wooden coffee table"
+    python3 -m skill_based.main --test-approach "blue container" --next-action container_place
 """
 
 import argparse
@@ -85,20 +85,13 @@ async def test_place(
 
 
 async def test_approach(
-    target_area: str,
-    next_action: str,
     object_name: str,
+    next_action: str,
 ) -> None:
-    print(f"\n=== Testing approach skill: '{target_area}' (next_action={next_action}) ===")
-    print(f"    Target object: '{object_name}'")
+    print(f"\n=== Testing approach skill: '{object_name}' (next_action={next_action}) ===")
     async with MCPClient() as mcp:
         t0 = time.perf_counter()
-        result = await approach_skill.run(
-            mcp=mcp,
-            target_area=target_area,
-            next_action=next_action,
-            object_name=object_name,
-        )
+        result = await approach_skill.run(mcp=mcp, object_name=object_name, next_action=next_action)
         result["wall_seconds"] = round(time.perf_counter() - t0, 2)
         print(f"\n=== Result ===")
         print(json.dumps(result, indent=2))
@@ -144,10 +137,9 @@ def main() -> None:
     parser.add_argument(
         "--test-approach",
         type=str,
-        nargs="+",
-        metavar="DEST",
+        metavar="OBJECT",
         default=None,
-        help="Test approach skill to DEST (no planner). Combine with --next-action and optionally --object-name.",
+        help="Test approach skill: drive up to OBJECT (no planner). Combine with --next-action.",
     )
     parser.add_argument(
         "--next-action",
@@ -160,7 +152,7 @@ def main() -> None:
         "--object-name",
         type=str,
         default=None,
-        help="Target object (e.g. 'wooden coffee table'). Required with --test-approach and --test-place.",
+        help="The held object's name. Required with --test-place.",
     )
     parser.add_argument(
         "--mode",
@@ -294,10 +286,7 @@ def main() -> None:
             args.pads_above_bottom_m,
         ))
     elif args.test_approach:
-        if not args.object_name:
-            parser.error("--test-approach requires --object-name")
-        dest = " ".join(args.test_approach)
-        asyncio.run(test_approach(dest, args.next_action, args.object_name))
+        asyncio.run(test_approach(args.test_approach, args.next_action))
     elif args.task:
         asyncio.run(run_full(args.task))
     else:

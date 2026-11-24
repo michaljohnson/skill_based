@@ -72,7 +72,7 @@ skill_based/
   planner.md               planner system prompt (loaded by planner.py)
   skills/                  deterministic Python skills (the architecture's middle layer)
     __init__.py
-    approach.py            nav2 + four-phase find-and-approach sequence
+    approach.py            find the object with the cameras (turning to search), face it, drive up to it
     pick.py                grasp pipeline (returns held_object_height_m)
     place.py               release pipeline with three-mode dispatch (container | surface | floor)
   utils/                   shared low-level helpers used by 2+ skills
@@ -95,7 +95,7 @@ cp skill_based/.env.example skill_based/.env
 # Single-skill smoke tests (assume robot is pre-positioned for pick/place):
 python3 -m skill_based.main --test-pick "red coke can"
 python3 -m skill_based.main --test-place "trash bin" --object-name "red coke can" --mode container --object-height-m 0.12
-python3 -m skill_based.main --test-approach "living room" --next-action pick --object-name "wooden coffee table"
+python3 -m skill_based.main --test-approach "blue container" --next-action container_place
 
 # Full planner loop:
 python3 -m skill_based.main --task "pick up the red coke can in the kitchen and place it on the wooden surface in the living room"
@@ -127,9 +127,9 @@ The planner does NOT see the underlying MCP tool surface. The skills do not call
 
 ## Adapting to your environment
 
-The skills assume specific MCP tool names (e.g. `perception__segment_objects`, `nav2__approach_target`, `moveit__plan_and_execute`). If your MCP servers expose different names, edit the calls inside `skills/*.py`. The architectural pattern (planner → deterministic skill → MCP tool) is independent of the specific tool names; only the strings need updating.
+The skills assume specific MCP tool names (e.g. `perception__segment_objects`, `nav2__drive_on_heading`, `moveit__plan_and_execute`). If your MCP servers expose different names, edit the calls inside `skills/*.py`. The architectural pattern (planner → deterministic skill → MCP tool) is independent of the specific tool names; only the strings need updating.
 
-The hardcoded entry-pose table in `skills/approach.py` is keyed to a particular simulated home environment. Replace with your own room/area coordinates.
+`skills/approach.py` needs no map: standoffs per next action and the reach window are constants at the top of the file; tune them for another arm.
 
 ## Design decisions
 
