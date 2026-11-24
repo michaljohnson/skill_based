@@ -460,3 +460,14 @@ def test_floor_drop_keeps_the_gap_to_the_whole_reference_footprint(x, y, half):
     nx = min(max(dx, x - half), x + half)
     ny = min(max(dy, y - half), y + half)
     assert ((dx - nx) ** 2 + (dy - ny) ** 2) ** 0.5 >= place.FLOOR_GAP_M - 1e-9
+
+
+def test_deep_grasp_keeps_the_fingertips_above_the_surface():
+    # pick_4 on the robot: pads 3.5 cm above the cube's bottom, fingertips 3.7 cm below the pads
+    mcp = FakeMCP(bin_pose=BOX)
+    result = _run(mcp, "surface", height=0.0715, pads=0.035)
+    assert result["success"], result["reason"]
+    box = _box(mcp)
+    box_top = box["position"][2] + box["dimensions"][2] / 2
+    fingertips = _drop_heights(mcp)[-1] - 0.225
+    assert fingertips - box_top == pytest.approx(0.01)
