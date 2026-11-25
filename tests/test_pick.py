@@ -171,7 +171,14 @@ def test_refuses_to_start_with_a_closed_gripper():
     result = _run(mcp)
     assert not result["success"]
     assert "not open" in result["reason"]
+    assert result["holding"] is True
     assert "moveit__plan_and_execute" not in mcp.names()
+
+
+def test_closed_empty_gripper_does_not_stop_the_pick():
+    mcp = FakeMCP(finger=0.689)  # run 02: left fully closed by an earlier failure
+    result = _run(mcp)
+    assert result["success"], result["reason"]
 
 
 def test_wrist_turn_compared_across_the_wrap():

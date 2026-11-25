@@ -334,6 +334,50 @@ def test_failure_carries_the_steps_and_success_does_not():
     world = FakeWorld(name="green cube")
     failed = asyncio.run(approach.run(world, "red ball", "pick"))
     assert any("backup 0.40 m" in line for line in failed["steps"])
-    assert "turned 6 times" in failed["reason"]
+    assert "turned 23 times" in failed["reason"]
     world = FakeWorld(obj=(2.0, 0.0))
     assert "steps" not in _run(world)
+
+
+def test_search_turns_two_rounds_the_second_shifted_half_a_step():
+    world = FakeWorld(name="green cube")
+    result = asyncio.run(approach.run(world, "red ball", "pick"))
+    assert result["failure"] == "not_found"
+    turns = [round(math.degrees(a["angle"]), 1) for n, a in world.calls if n == "nav2__spin_robot"]
+    assert turns == [30.0] * 11 + [45.0] + [30.0] * 11  # run 04: 60 deg steps missed the container
+
+
+def test_missing_point_cloud_is_segmented_again():
+    world = FakeWorld(obj=(2.0, 0.0))
+    first = [True]
+
+    async def no_cloud_once(name, args, _orig=world.call_tool_prefixed):
+        if name == "perception__segment_objects" and first[0]:
+            first[0] = False
+            world.calls.append((name, args))
+            return ("ERROR: Segmentation service reported SUCCESS, but its point cloud did not arrive "
+                    "within 20s. Please segment again.")
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = no_cloud_once
+    result = _run(world)
+    assert result["success"], result["reason"]
+    assert "nav2__backup_robot" not in world.names()  # found on the first look, after the retry
+    assert [a["camera"] for n, a in world.calls if n == "perception__segment_objects"][:2] == ["front", "front"]
+
+
+def test_motion_is_told_in_time_order():
+    world = FakeWorld(obj=(-2.0, 0.3))
+
+    async def no_backup(name, args, _orig=world.call_tool_prefixed):
+        if name == "nav2__backup_robot":
+            world.calls.append((name, args))
+            return "Error: Backup operation failed"
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = no_backup
+    result = _run(world)
+    reason = result["reason"]
+    # run 01: the refused backup came first but was reported last
+    assert reason.index("stopped partway through a 0.40 m backup") < reason.index("turned")
+    assert reason.index("turned") < reason.index("drove")

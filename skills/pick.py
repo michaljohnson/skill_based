@@ -161,7 +161,7 @@ async def _run(mcp: MCPClient, object_name: str, steps: list[str]) -> dict:
         return {**base_result, "success": False, "failure": failure, "reason": reason,
                 "holding": holding, "tool_calls_used": tool_calls, "steps": list(steps)}
 
-    # Step 0 — the gripper must be open; a closed one may still hold something
+    # Step 0 — the gripper must not hold anything; closed and empty is fine, it opens before the grasp
     try:
         finger = await gripper_position(mcp)
     except Exception as e:
@@ -171,12 +171,12 @@ async def _run(mcp: MCPClient, object_name: str, steps: list[str]) -> dict:
     if finger is None:
         return fail("gripper_failed", "Gripper position unknown (/joint_states without finger_joint); "
                                       "nothing moved.", holding=None)
-    if finger > HOLD_MIN:
-        held = HOLD_MIN <= finger <= HOLD_MAX
+    if HOLD_MIN < finger <= HOLD_MAX:
         return fail("gripper_not_open", (
-            f"The gripper is not open (finger_joint {finger:.3f}): "
-            f"{'it probably holds an object, place it first' if held else 'it is closed, open it first'}. "
-            "Nothing moved."), holding=held)
+            f"The gripper is not open (finger_joint {finger:.3f}): it probably holds an object, place it first. "
+            "Nothing moved."), holding=True)
+    if finger > HOLD_MAX:
+        logger.info(f"gripper closed and empty (finger_joint {finger:.3f}); it opens before the grasp")
 
     # Step 1 — arm to look_forward (joint_state primary)
     arm = await move_arm_to_look_forward(mcp)
