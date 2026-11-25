@@ -45,9 +45,11 @@ STANDOFF_BY_NEXT_ACTION = {
 
 # Detections farther than this are another object across the room, not the target.
 MAX_RANGE_M = 4.0
-# Search: turn this far between looks, at most a full turn.
-SEARCH_STEP_RAD = math.radians(60)
-SEARCH_STEPS = 6
+# Search: 30 deg steps keep the front camera's +-30 deg views overlapping when turns overshoot; a second
+# round, shifted half a step, for objects seen badly from one angle.
+SEARCH_STEP_RAD = math.radians(30)
+STEPS_PER_ROUND = 12
+SEARCH_STEPS = 2 * STEPS_PER_ROUND - 1
 # Facing: turn again while the bearing is larger than this, at most this often.
 BEARING_TOL_RAD = math.radians(6)
 MAX_TURNS = 3
@@ -96,23 +98,29 @@ class _Tally:
     """What one approach call saw and did, for the result's reason."""
 
     looks: list[str] = field(default_factory=list)  # one segmentation status per look; TOO_FAR = beyond range
-    forward_m: float = 0.0
-    back_m: float = 0.0
-    turns: int = 0
-    stopped: str = ""  # a refused or aborted motion: nav2 does not say how far it got
+    # [kind, amount] in time order, runs of the same kind merged; kind: forward, back, turn, stopped
+    moves: list[list] = field(default_factory=list)
+
+    def add(self, kind: str, amount) -> None:
+        if self.moves and self.moves[-1][0] == kind and kind != "stopped":
+            self.moves[-1][1] += amount
+        else:
+            self.moves.append([kind, amount])
 
     def motion(self) -> str:
         parts = []
-        if self.forward_m:
-            parts.append(f"drove {self.forward_m:.2f} m forward")
-        if self.back_m:
-            parts.append(f"backed up {self.back_m:.2f} m")
-        if self.turns:
-            parts.append(f"turned {self.turns} time{'s' if self.turns > 1 else ''}")
-        if self.stopped:
-            parts.append(f"{'then ' if parts else ''}stopped partway through a {self.stopped} "
-                         "(nav2 does not report how far it got)")
-        return f"The base {', '.join(parts)}." if parts else "The base did not move."
+        for kind, amount in self.moves:
+            if kind == "forward":
+                parts.append(f"drove {amount:.2f} m forward")
+            elif kind == "back":
+                parts.append(f"backed up {amount:.2f} m")
+            elif kind == "turn":
+                parts.append(f"turned {amount} time{'s' if amount > 1 else ''}")
+            else:
+                parts.append(f"stopped partway through a {amount} (nav2 does not report how far it got)")
+        if not parts:
+            return "The base did not move."
+        return f"The base {parts[0]}" + "".join(f", then {p}" for p in parts[1:]) + "."
 
     def errors(self) -> list[str]:
         return [s for s in self.looks if s not in SEG_ANSWERS + ("TOO_FAR",)]
@@ -130,6 +138,14 @@ async def _measure(
             )
             calls += 1
             status = parse_seg_status(raw)
+            if status == "UNKNOWN" and "reported SUCCESS" in str(raw):
+                logger.info(f"{camera}: SAM3 found '{object_name}' but the point cloud did not arrive; "
+                            "segmenting again")
+                raw = await mcp.call_tool_prefixed(
+                    "perception__segment_objects", {"prompt": object_name, "camera": camera, "timeout": 20}
+                )
+                calls += 1
+                status = parse_seg_status(raw)
             logger.info(f"{camera} SAM3 '{object_name}' -> {status}")
             if status == "UNKNOWN":
                 logger.warning(f"{camera} segment_objects reply: {str(raw)[:300]}")
@@ -172,9 +188,10 @@ async def _turn(mcp: MCPClient, angle: float, tally: _Tally) -> tuple[bool, str]
     reply = await mcp.call_tool_prefixed("nav2__spin_robot", {"angle": round(angle, 4)})
     await wait_until_still(mcp)
     ok = _ok(reply)
-    tally.turns += ok
-    if not ok:
-        tally.stopped = f"{math.degrees(angle):+.0f} deg turn"
+    if ok:
+        tally.add("turn", 1)
+    else:
+        tally.add("stopped", f"{math.degrees(angle):+.0f} deg turn")
     logger.info(f"turn {math.degrees(angle):+.0f} deg -> {'done' if ok else 'FAILED: ' + _nav2_text(reply)}")
     return ok, _nav2_text(reply)
 
@@ -220,12 +237,9 @@ async def _drive(mcp: MCPClient, gap: float, tally: _Tally) -> tuple[bool, str, 
     ok = _ok(reply)
     if ok:
         await wait_until_still(mcp)
-        if leg > 0:
-            tally.forward_m += leg
-        else:
-            tally.back_m -= leg
+        tally.add("forward" if leg > 0 else "back", abs(leg))
     else:
-        tally.stopped = f"{abs(leg):.2f} m {what}"
+        tally.add("stopped", f"{abs(leg):.2f} m {what}")
     logger.info(f"{what} {abs(leg):.2f} m -> {'done' if ok else 'FAILED: ' + _nav2_text(reply)}")
     why = f"nav2 stopped the {what} ({_nav2_text(reply)}); usually an obstacle in the robot's path."
     return ok, why, leg
@@ -269,7 +283,7 @@ async def _run(mcp: MCPClient, object_name: str, next_action: str, steps: list[s
         return fail("arm_failed", f"Moving the arm to look_forward failed ({arm.get('reason')}). "
                                   "Usually the UR program is not running.")
 
-    # Find: look ahead, back up once and look again, then turn on the spot, up to a full turn.
+    # Find: look ahead, back up once and look again, then turn on the spot, up to two rounds.
     m, c = await _measure(mcp, object_name, ("front", "arm"), tally)
     tool_calls += c
     if m is None:
@@ -285,7 +299,8 @@ async def _run(mcp: MCPClient, object_name: str, next_action: str, steps: list[s
     while m is None and step < SEARCH_STEPS:
         step += 1
         logger.info(f"search {step}/{SEARCH_STEPS}")
-        ok, reply = await _turn(mcp, SEARCH_STEP_RAD, tally)
+        # into round two an extra half step: 0, 30 ... 330, then 15, 45 ... 345 deg
+        ok, reply = await _turn(mcp, SEARCH_STEP_RAD * (1.5 if step == STEPS_PER_ROUND else 1), tally)
         tool_calls += 1
         if not ok:
             return fail("turn_failed", f"'{object_name}' not seen yet; nav2 refused search turn {step} ({reply}).")
@@ -302,7 +317,7 @@ async def _run(mcp: MCPClient, object_name: str, next_action: str, steps: list[s
         also = f" SAM3 found a '{object_name}' only beyond {MAX_RANGE_M} m ({far} times): another object." if far else ""
         return fail("not_found", (
             f"'{object_name}' not seen on {len(tally.looks)} looks with the front and arm cameras, "
-            f"after backing up and over a full turn.{also} It is not within {MAX_RANGE_M} m, hidden, "
+            f"after backing up and over two turns on the spot.{also} It is not within {MAX_RANGE_M} m, hidden, "
             "or too small to see from here (small objects only from ~1.7 m)."))
 
     # Face it and drive in, measuring after every leg.
