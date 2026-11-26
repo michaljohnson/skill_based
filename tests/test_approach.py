@@ -15,6 +15,8 @@ from skill_based.skills import approach
 from test_pick import DONE
 
 HALF_DEPTH = 0.04  # object centroid behind its near face
+NAV_FAILED = json.dumps({"error": "NavigationError", "message": "Navigation to pose failed",
+                         "error_code": "NAVIGATION_FAILED"})
 FOV = {"front": (math.radians(30), 0.4, 6.0), "arm": (math.radians(25), 0.8, 3.0)}
 
 
@@ -29,6 +31,12 @@ class FakeWorld:
         self.blind_below = 0.0  # neither camera sees the object closer than this
         self.ghost = None  # after the first drive SAM3 picks this base-frame (x, y) instead
         self.drives = 0
+        # nav2 navigate_to_pose: reaches its goal this far short and this far off its heading (rad),
+        # or gives up (no path) after nav_fail_after metres, or the call raises nav_raise
+        self.nav_short = 0.15
+        self.nav_yaw_err = math.radians(10)
+        self.nav_fail_after = None
+        self.nav_raise = None
 
     def _in_base(self):
         dx, dy = self.obj[0] - self.x, self.obj[1] - self.y
@@ -66,6 +74,20 @@ class FakeWorld:
         if name == "nav2__spin_robot":
             self.yaw += args["angle"] * self.overshoot
             return f"Successfully spun robot by {args['angle']:.2f} radians"
+        if name == "nav2__get_robot_pose":
+            return json.dumps({"position": {"x": self.x, "y": self.y}, "orientation": {"yaw": self.yaw}})
+        if name == "nav2__navigate_to_pose":
+            if self.nav_raise:
+                raise self.nav_raise
+            gx, gy = args["x"], args["y"]
+            d = math.hypot(gx - self.x, gy - self.y)
+            moved = self.nav_fail_after if self.nav_fail_after is not None else max(0.0, d - self.nav_short)
+            self.x += (gx - self.x) * moved / d
+            self.y += (gy - self.y) * moved / d
+            self.yaw = args["yaw"] + self.nav_yaw_err
+            if self.nav_fail_after is not None:
+                return NAV_FAILED
+            return f"Successfully navigated to pose ({gx:.2f}, {gy:.2f}, {args['yaw']:.2f})"
         if name in ("nav2__drive_on_heading", "nav2__backup_robot"):
             d = args["distance"] if name == "nav2__drive_on_heading" else -args["distance"]
             self.drives += 1
@@ -86,6 +108,12 @@ def no_waiting(monkeypatch):
     monkeypatch.setattr(approach, "wait_until_still", still)
 
 
+@pytest.fixture
+def no_nav(monkeypatch):
+    """Drive the whole way in legs, as before nav2 was used for the long way."""
+    monkeypatch.setattr(approach, "NAV_ABOVE_M", 99.0)
+
+
 def _run(world, next_action="pick"):
     return asyncio.run(approach.run(world, world.name, next_action))
 
@@ -95,7 +123,7 @@ def _at_standoff(world, next_action="pick"):
 
 
 def test_object_straight_ahead_ends_at_the_standoff():
-    world = FakeWorld(obj=(2.0, 0.0))
+    world = FakeWorld(obj=(1.3, 0.0))
     result = _run(world)
     assert result["success"], result["reason"]
     assert _at_standoff(world)
@@ -194,7 +222,7 @@ def test_object_too_close_for_the_cameras_counts_as_reached_by_odometry():
     assert _at_standoff(world, "container_place")
 
 
-def test_lost_close_to_the_standoff_drives_the_rest_blind():
+def test_lost_close_to_the_standoff_drives_the_rest_blind(no_nav):
     world = FakeWorld(obj=(1.9 + HALF_DEPTH, 0.0))  # first leg 0.8 m leaves 0.4 m to go
     world.blind_below = 1.2
     result = _run(world, "surface_place")
@@ -204,7 +232,7 @@ def test_lost_close_to_the_standoff_drives_the_rest_blind():
     assert _at_standoff(world, "surface_place")
 
 
-def test_object_lost_far_from_the_standoff_still_fails():
+def test_object_lost_far_from_the_standoff_still_fails(no_nav):
     world = FakeWorld(obj=(3.5, 0.0))  # first leg 0.8 m ends ~1.8 m short of the standoff
     world.blind_below = 3.0
     result = _run(world)
@@ -245,7 +273,7 @@ def test_beyond_the_window_drives_one_more_leg():
     assert _at_standoff(world, "surface_place")
 
 
-def test_long_way_is_driven_in_short_legs():
+def test_without_nav2_the_long_way_is_driven_in_short_legs(no_nav):
     world = FakeWorld(obj=(3.0, 0.0))
     result = _run(world)
     assert result["success"], result["reason"]
@@ -312,7 +340,7 @@ def test_arm_failure_names_the_moveit_verdict():
     assert "The base did not move." in result["reason"]
 
 
-def test_refused_drive_is_reported_with_where_the_object_is():
+def test_refused_drive_is_reported_with_where_the_object_is(no_nav):
     world = FakeWorld(obj=(2.0, 0.0))
 
     async def blocked(name, args, _orig=world.call_tool_prefixed):
@@ -323,8 +351,9 @@ def test_refused_drive_is_reported_with_where_the_object_is():
         return await _orig(name, args)
 
     world.call_tool_prefixed = blocked
+    world.nav_fail_after = 0.0  # no way around either
     result = _run(world)
-    assert result["failure"] == "drive_failed"
+    assert result["failure"] == "nav_failed"
     assert "1.96 m" in result["reason"]  # where it saw the object
     assert "did not move" not in result["reason"]  # approach_24: it drove until the obstacle
     assert "stopped partway through a 0.80 m drive" in result["reason"]
@@ -381,3 +410,116 @@ def test_motion_is_told_in_time_order():
     # run 01: the refused backup came first but was reported last
     assert reason.index("stopped partway through a 0.40 m backup") < reason.index("turned")
     assert reason.index("turned") < reason.index("drove")
+
+
+def test_far_object_goes_with_nav2_then_short_legs():
+    world = FakeWorld(obj=(3.5, 0.4))
+    result = _run(world, "container_place")
+    assert result["success"], result["reason"]
+    assert _at_standoff(world, "container_place")
+    names = world.names()
+    assert names.count("nav2__navigate_to_pose") == 1
+    assert names.index("nav2__navigate_to_pose") < names.index("nav2__drive_on_heading")
+    assert "with nav2" in result["reason"]
+
+
+def test_near_object_does_not_use_nav2():
+    world = FakeWorld(obj=(1.3, 0.0))  # near face 1.26 m: within NAV_ABOVE_M of the 0.85 m standoff
+    _run(world)
+    assert "nav2__navigate_to_pose" not in world.names()
+
+
+def test_nav2_goal_stays_short_of_the_standoff_facing_the_object():
+    world = FakeWorld(obj=(3.0 + HALF_DEPTH, 0.0))
+    _run(world, "container_place")
+    goal = next(a for n, a in world.calls if n == "nav2__navigate_to_pose")
+    # near face 3.0 m, standoff 0.65 m: goal NAV_SHORT_M before the standoff, facing it
+    assert goal["x"] == pytest.approx(3.0 - 0.65 - approach.NAV_SHORT_M, abs=0.01)
+    assert goal["y"] == pytest.approx(0.0, abs=0.01) and goal["yaw"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_nav2_without_a_path_is_nav_failed_with_the_real_distance():
+    world = FakeWorld(obj=(3.5, 0.0))
+    world.nav_fail_after = 1.1
+    result = _run(world)
+    assert result["failure"] == "nav_failed"
+    assert "Navigation to pose failed" in result["reason"]
+    assert "drove 1.10 m with nav2" in result["reason"]  # taken from the map pose, not the goal
+    assert "nav2__drive_on_heading" not in world.names()
+
+
+def test_nav2_timeout_cancels_the_goal():
+    world = FakeWorld(obj=(3.5, 0.0))
+    world.nav_raise = TimeoutError("read timeout")
+    result = _run(world)
+    assert result["failure"] == "nav_failed"
+    assert "nav2__cancel_navigation" in world.names()
+
+
+def test_off_heading_after_nav2_turns_once_and_finds_it():
+    world = FakeWorld(obj=(3.5, 0.0))
+    world.nav_yaw_err = math.radians(40)  # beyond both cameras' view
+    result = _run(world)
+    assert result["success"], result["reason"]
+    names = world.names()
+    after = names[names.index("nav2__navigate_to_pose"):]
+    assert after.index("nav2__spin_robot") < after.index("nav2__drive_on_heading")
+
+
+def test_refused_straight_drive_is_driven_by_nav2_instead(no_nav):
+    world = FakeWorld(obj=(1.6, 0.0))
+    refused = [True]
+
+    async def blocked_once(name, args, _orig=world.call_tool_prefixed):
+        if name == "nav2__drive_on_heading" and refused[0]:
+            refused[0] = False
+            world.calls.append((name, args))
+            return "Drive on heading operation failed"
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = blocked_once
+    world.nav_short = 0.0
+    world.nav_yaw_err = 0.0
+    result = _run(world)  # approach_4: nav2 stopped beside the bin, the straight line to the box was blocked
+    assert result["success"], result["reason"]
+    goal = next(a for n, a in world.calls if n == "nav2__navigate_to_pose")
+    assert goal["x"] == pytest.approx(1.6 - HALF_DEPTH - approach.STANDOFF_BY_NEXT_ACTION["pick"], abs=0.02)
+    assert "stopped partway" in result["reason"] and "with nav2" in result["reason"]
+
+
+def test_refused_backup_is_not_driven_by_nav2():
+    world = FakeWorld(obj=(0.5 + HALF_DEPTH, 0.0))  # near face 0.5 m, floor_place wants 0.85: backs up
+
+    async def no_backup(name, args, _orig=world.call_tool_prefixed):
+        if name == "nav2__backup_robot":
+            world.calls.append((name, args))
+            return "Backup operation failed"
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = no_backup
+    result = _run(world, "floor_place")
+    assert result["failure"] == "drive_failed"
+    assert "nav2__navigate_to_pose" not in world.names()  # it would have driven towards the object
+
+
+def test_nav2_goal_geometry_off_axis():
+    m = {"dist": 2.04, "near": 2.0, "bearing": math.radians(90)}
+    goal = approach._nav_goal((1.0, 1.0, 0.0), m, standoff=0.65, short=0.3)
+    assert goal["x"] == pytest.approx(1.0, abs=1e-6) and goal["y"] == pytest.approx(1.0 + 2.0 - 0.95)
+    assert goal["yaw"] == pytest.approx(math.pi / 2) and goal["obj"][1] == pytest.approx(3.04)
+
+
+def test_drive_refused_after_reaching_the_standoff_is_not_sent_to_nav2(no_nav):
+    world = FakeWorld(obj=(1.3, 0.0))  # near face 1.26 m, one 0.41 m leg to the 0.85 m standoff
+
+    async def stops_late(name, args, _orig=world.call_tool_prefixed):
+        if name == "nav2__drive_on_heading":
+            world.calls.append((name, args))
+            world.x += args["distance"] + 0.05  # it overran a little, then reported a failure
+            return "Drive on heading operation failed"
+        return await _orig(name, args)
+
+    world.call_tool_prefixed = stops_late
+    result = _run(world)
+    assert result["success"], result["reason"]
+    assert "nav2__navigate_to_pose" not in world.names()  # a goal behind the robot
