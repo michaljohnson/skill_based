@@ -75,6 +75,7 @@ the skill's own log lines, for cases the table does not cover. Choose the next a
 |---|---|---|
 | `lost`, `not_facing`, `not_at_standoff`, `turn_failed` | approach | Call `approach` again with the same args, once. |
 | `drive_failed` | approach | Usually an obstacle in the path. Call `approach` again once; if it fails again, end the task. |
+| `nav_failed` | approach | nav2 found no free path around the obstacles. Call `approach` again once; if it fails again, end the task. |
 | `not_found` | approach | The object is not within reach of the search. End the task. |
 | `not_found`, `target_not_found`, `out_of_reach`, `too_close`, `implausible_target` | pick, place | Positional: call `approach` for that object with the matching `next_action`, then the skill again, once. |
 | `grasp_empty` | pick | The grasp missed. Call `approach(object, "pick")`, then `pick` again; at most twice. |

@@ -1,8 +1,9 @@
 """Approach skill: drive the base up to a named object, wherever it stands.
 
-No map and no rooms. The skill finds the object with the cameras (turning on
-the spot to search if needed), turns to face it, and drives straight towards
-it until its near face is at the standoff ``next_action`` needs. Turns on the
+No rooms. The skill finds the object with the cameras (turning on the spot to
+search if needed). A long way is driven by nav2 to a goal short of the standoff,
+around obstacles; then the skill turns to face the object and drives straight
+towards it until its near face is at the standoff ``next_action`` needs. Turns on the
 real base overshoot (up to 2x on small angles), so every turn is followed by a new
 measurement, and so is every drive leg.
 
@@ -78,6 +79,10 @@ BLIND_MAX_M = 0.5
 BACKUP_LOOK_M = 0.4
 # Closer than this the arm camera measures better than the front camera.
 ARM_FIRST_BELOW_M = 1.5
+# Long way: nav2 drives to a goal short of the standoff, around obstacles; the short legs do the rest
+# (nav2 stops within ~0.2 m and ~15 deg of its goal, too coarse for the standoff).
+NAV_ABOVE_M = 0.5  # nav2 drives when the near face is more than this beyond the standoff
+NAV_SHORT_M = 0.3  # its goal stays this far before the standoff; the short legs finish
 
 
 def _ok(reply) -> bool:
@@ -98,7 +103,7 @@ class _Tally:
     """What one approach call saw and did, for the result's reason."""
 
     looks: list[str] = field(default_factory=list)  # one segmentation status per look; TOO_FAR = beyond range
-    # [kind, amount] in time order, runs of the same kind merged; kind: forward, back, turn, stopped
+    # [kind, amount] in time order, runs of the same kind merged; kind: forward, back, nav, turn, stopped
     moves: list[list] = field(default_factory=list)
 
     def add(self, kind: str, amount) -> None:
@@ -114,6 +119,8 @@ class _Tally:
                 parts.append(f"drove {amount:.2f} m forward")
             elif kind == "back":
                 parts.append(f"backed up {amount:.2f} m")
+            elif kind == "nav":
+                parts.append(f"drove {amount:.2f} m with nav2")
             elif kind == "turn":
                 parts.append(f"turned {amount} time{'s' if amount > 1 else ''}")
             else:
@@ -245,6 +252,100 @@ async def _drive(mcp: MCPClient, gap: float, tally: _Tally) -> tuple[bool, str, 
     return ok, why, leg
 
 
+async def _map_pose(mcp: MCPClient) -> tuple[float, float, float]:
+    raw = await mcp.call_tool_prefixed("nav2__get_robot_pose", {})
+    p = json.loads(raw) if isinstance(raw, str) else raw
+    return float(p["position"]["x"]), float(p["position"]["y"]), float(p["orientation"]["yaw"])
+
+
+def _nav_goal(pose: tuple[float, float, float], m: dict, standoff: float, short: float) -> dict:
+    """Map-frame goal ``short`` before the standoff on the line to the object, facing it, and the object's position."""
+    x, y, yaw = pose
+    heading = math.atan2(math.sin(yaw + m["bearing"]), math.cos(yaw + m["bearing"]))
+    go = m["near"] - standoff - short
+    return {"x": x + go * math.cos(heading), "y": y + go * math.sin(heading), "yaw": heading, "go": go,
+            "obj": (x + m["dist"] * math.cos(heading), y + m["dist"] * math.sin(heading))}
+
+
+def _expected_from(pose: tuple[float, float, float], goal: dict, m: dict) -> dict:
+    """Where the object should be from ``pose``, by the map (the object did not move)."""
+    x, y, yaw = pose
+    ox, oy = goal["obj"]
+    dist = math.hypot(ox - x, oy - y)
+    off = math.atan2(oy - y, ox - x) - yaw
+    return {"camera": "map", "dist": dist, "near": dist - (m["dist"] - m["near"]),
+            "bearing": math.atan2(math.sin(off), math.cos(off))}
+
+
+async def _find_again(mcp: MCPClient, object_name: str, expected: dict, tally: _Tally) -> tuple[dict | None, int, str, str]:
+    """Measure the object where the map puts it; turn once towards it if neither camera sees it."""
+    seen, calls = await _measure(mcp, object_name, _cameras(expected), tally)
+    if seen is None and abs(expected["bearing"]) > BEARING_TOL_RAD:
+        ok, reply = await _turn(mcp, expected["bearing"] * TURN_GAIN, tally)
+        calls += 1
+        if not ok:
+            return None, calls, "turn_failed", f"nav2 refused the turn towards '{object_name}' ({reply})."
+        seen, c = await _measure(mcp, object_name, _cameras(expected), tally)
+        calls += c
+    if seen is not None and abs(seen["near"] - expected["near"]) > LOST_TOL_M:
+        logger.info(f"{seen['camera']}: {seen['near']:.2f} m, expected {expected['near']:.2f} m: another object")
+        seen = None
+    if seen is None:
+        return None, calls, "lost", (
+            f"nav2 reached its goal, but neither camera sees '{object_name}' where the map pose puts it "
+            f"({_where(expected)}).")
+    return seen, calls, "", ""
+
+
+async def _navigate(
+    mcp: MCPClient, object_name: str, m: dict, standoff: float, tally: _Tally, short: float = NAV_SHORT_M
+) -> tuple[dict | None, int, str, str]:
+    """Let nav2 drive, around obstacles, to a goal ``short`` before the standoff; find the object again there.
+
+    Returns (measurement, calls, failure, reason); measurement None on failure.
+    """
+    calls = 1
+    try:
+        start = await _map_pose(mcp)
+    except Exception as e:
+        return None, calls, "nav_failed", f"No robot pose in the map from nav2 ({e}); nothing moved."
+    goal = _nav_goal(start, m, standoff, short)
+    go = goal["go"]
+    logger.info(f"nav2 to ({goal['x']:.2f}, {goal['y']:.2f}) in map, {go:.2f} m towards '{object_name}' "
+                f"at ({goal['obj'][0]:.2f}, {goal['obj'][1]:.2f})")
+    calls += 1
+    try:
+        reply = await mcp.call_tool_prefixed(
+            "nav2__navigate_to_pose", {"x": round(goal["x"], 3), "y": round(goal["y"], 3), "yaw": round(goal["yaw"], 4)})
+    except Exception as e:  # e.g. the client timeout: do not leave the goal running
+        reply = f"no answer ({e})"
+        calls += 1
+        try:
+            await mcp.call_tool_prefixed("nav2__cancel_navigation", {})
+        except Exception as e2:
+            reply += f"; cancel failed too ({e2})"
+    await wait_until_still(mcp)
+    ok = _ok(reply)
+    calls += 1
+    try:
+        now = await _map_pose(mcp)
+    except Exception as e:
+        tally.add("stopped", f"{go:.2f} m nav2 drive")
+        return None, calls, "nav_failed", (
+            f"nav2 {'reached' if ok else 'did not reach'} the goal {go:.2f} m towards '{object_name}' "
+            f"({_nav2_text(reply)}), but its robot pose is unavailable now ({e}).")
+    tally.add("nav", math.hypot(now[0] - start[0], now[1] - start[1]))
+    expected = _expected_from(now, goal, m)
+    logger.info(f"nav2 -> {'done' if ok else 'FAILED: ' + _nav2_text(reply)}; "
+                f"'{object_name}' expected at {_where(expected)}")
+    if not ok:
+        return None, calls, "nav_failed", (
+            f"nav2 could not reach the goal {go:.2f} m towards '{object_name}' ({_nav2_text(reply)}); "
+            f"by the map pose '{object_name}' is now at {_where(expected)}. Usually no free path.")
+    seen, c, failure, why = await _find_again(mcp, object_name, expected, tally)
+    return seen, calls + c, failure, why
+
+
 async def run(mcp: MCPClient, object_name: str, next_action: str) -> dict:
     """Drive up to ``object_name`` so that ``next_action`` can reach it.
 
@@ -320,7 +421,15 @@ async def _run(mcp: MCPClient, object_name: str, next_action: str, steps: list[s
             f"after backing up and over two turns on the spot.{also} It is not within {MAX_RANGE_M} m, hidden, "
             "or too small to see from here (small objects only from ~1.7 m)."))
 
+    # A long way: nav2, around obstacles, to short of the standoff.
+    if m["near"] - standoff > NAV_ABOVE_M:
+        m, c, failure, why = await _navigate(mcp, object_name, m, standoff, tally)
+        tool_calls += c
+        if m is None:
+            return fail(failure, why)
+
     # Face it and drive in, measuring after every leg.
+    rerouted = False
     for _ in range(MAX_LEGS):
         m, c, failure, why = await _face(mcp, object_name, m, tally)
         tool_calls += c
@@ -331,7 +440,24 @@ async def _run(mcp: MCPClient, object_name: str, next_action: str, steps: list[s
         ok, why, leg = await _drive(mcp, m["near"] - standoff, tally)
         tool_calls += 1
         if not ok:
-            return fail("drive_failed", f"'{object_name}' was at {_where(m)} before the drive; {why}")
+            why = f"'{object_name}' was at {_where(m)} before the drive; {why}"
+            if rerouted or leg <= 0:  # a refused backup has nothing to drive around
+                return fail("drive_failed", why)
+            # Something in the straight line (e.g. nav2 stopped beside an obstacle): nav2 drives the rest, around it.
+            rerouted = True
+            logger.info("straight drive refused: nav2 drives to the standoff instead")
+            seen, c = await _measure(mcp, object_name, _cameras(m), tally)  # the refused drive may have moved
+            tool_calls += c
+            if seen is None:
+                return fail("drive_failed", why)
+            if seen["near"] <= standoff:  # it got there before it stopped: no goal for nav2 ahead
+                m = seen
+                continue
+            m, c, failure, why2 = await _navigate(mcp, object_name, seen, standoff, tally, short=0.0)
+            tool_calls += c
+            if m is None:
+                return fail(failure, f"{why} Then {why2}")
+            continue
         expected = m["near"] - leg
         seen, c = await _measure(mcp, object_name, _cameras(m), tally)
         tool_calls += c
