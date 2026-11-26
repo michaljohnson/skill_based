@@ -21,7 +21,11 @@ A deterministic-skills agentic architecture for long-horizon mobile-manipulation
 ## Short Demo (sim and real)
 
 
-https://github.com/user-attachments/assets/54cde662-d05a-4164-9f48-af8ceb425218
+
+
+https://github.com/user-attachments/assets/0859f276-789f-4c06-a365-639432c638e7
+
+
 
 
 
